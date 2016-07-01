@@ -30,6 +30,7 @@ type Transformer struct {
 	tempDir              string
 	exportNetworkEnvVars bool
 	clock                clock.Clock
+	zone		     string
 }
 
 func NewTransformer(
@@ -42,6 +43,7 @@ func NewTransformer(
 	tempDir string,
 	exportNetworkEnvVars bool,
 	clock clock.Clock,
+	zone string,
 ) *Transformer {
 	return &Transformer{
 		cachedDownloader:     cachedDownloader,
@@ -53,6 +55,7 @@ func NewTransformer(
 		tempDir:              tempDir,
 		exportNetworkEnvVars: exportNetworkEnvVars,
 		clock:                clock,
+		zone: 		      zone,
 	}
 }
 
@@ -77,6 +80,7 @@ func (transformer *Transformer) StepFor(
 			ports,
 			transformer.exportNetworkEnvVars,
 			transformer.clock,
+			transformer.zone,
 		)
 
 	case *models.DownloadAction:

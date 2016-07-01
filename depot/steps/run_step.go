@@ -28,19 +28,21 @@ type runStep struct {
 	portMappings         []executor.PortMapping
 	exportNetworkEnvVars bool
 	clock                clock.Clock
+	zone                 string
 
 	*canceller
 }
 
 func NewRun(
-	container garden.Container,
-	model models.RunAction,
-	streamer log_streamer.LogStreamer,
-	logger lager.Logger,
-	externalIP string,
-	portMappings []executor.PortMapping,
-	exportNetworkEnvVars bool,
-	clock clock.Clock,
+container garden.Container,
+model models.RunAction,
+streamer log_streamer.LogStreamer,
+logger lager.Logger,
+externalIP string,
+portMappings []executor.PortMapping,
+exportNetworkEnvVars bool,
+clock clock.Clock,
+zone string,
 ) *runStep {
 	logger = logger.Session("run-step")
 	return &runStep{
@@ -52,6 +54,7 @@ func NewRun(
 		portMappings:         portMappings,
 		exportNetworkEnvVars: exportNetworkEnvVars,
 		clock:                clock,
+		zone:                      zone,
 
 		canceller: newCanceller(),
 	}
@@ -60,7 +63,7 @@ func NewRun(
 func (step *runStep) Perform() error {
 	step.logger.Info("running")
 
-	envVars := convertEnvironmentVariables(step.model.Env)
+	envVars := step.convertEnvironmentVariables(step.model.Env)
 
 	if step.exportNetworkEnvVars {
 		envVars = append(envVars, step.networkingEnvVars()...)
@@ -194,14 +197,59 @@ func (step *runStep) Perform() error {
 	panic("unreachable")
 }
 
-func convertEnvironmentVariables(environmentVariables []*models.EnvironmentVariable) []string {
+func (step *runStep) convertEnvironmentVariables(environmentVariables []*models.EnvironmentVariable) []string {
 	converted := []string{}
 
 	for _, env := range environmentVariables {
-		converted = append(converted, env.Name+"="+env.Value)
+		val := step.dezoneVcapServices(env)
+		converted = append(converted, env.Name + "=" + val)
 	}
 
 	return converted
+}
+
+func (step *runStep) dezoneVcapServices(env *models.EnvironmentVariable) string {
+
+	if env.Name == "VCAP_SERVICES" {
+		return step.checkIfZonedConfig(env.Value)
+	}
+
+	return env.Value
+}
+
+func (step *runStep) checkIfZonedConfig(vcapServicesJson string) string {
+
+	var parsed map[string]interface{}
+
+	err := json.Unmarshal([]byte(vcapServicesJson), &parsed)
+	if err != nil {
+		step.logger.Error("error-parsing-vcap-services-json", err)
+		return vcapServicesJson
+	}
+
+	for _, v := range parsed {
+		vv, ok := v.([]interface{})
+		if ok {
+			vvv, ok := vv[0].(map[string]interface{})
+			if ok {
+				creds, ok := vvv["credentials"].(map[string]interface{})
+				if ok {
+					if val, ok := creds[step.zone]; ok {
+						// replace zoned credentials with details for the zone we are in
+						vvv["credentials"] = val
+					}
+				}
+			}
+		}
+	}
+
+	data, err := json.Marshal(parsed)
+	if err != nil {
+		step.logger.Error("error-marshalling-vcap-services", err)
+		return vcapServicesJson
+	}
+
+	return string(data)
 }
 
 func (step *runStep) networkingEnvVars() []string {

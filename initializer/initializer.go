@@ -79,6 +79,8 @@ type Configuration struct {
 
 	MemoryMB string
 	DiskMB   string
+
+	Zone string			// nimbus2 {hemel|slough}
 }
 
 const (
@@ -140,6 +142,7 @@ func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (e
 		config.SkipCertVerify,
 		config.ExportNetworkEnvVars,
 		clock,
+		config.Zone,
 	)
 
 	hub := event.NewHub()
@@ -330,6 +333,7 @@ func initializeTransformer(
 	skipSSLVerification bool,
 	exportNetworkEnvVars bool,
 	clock clock.Clock,
+	zone string,
 ) *transformer.Transformer {
 	cache := cacheddownloader.New(cachePath, workDir, int64(maxCacheSizeInBytes), 10*time.Minute, int(math.MaxInt8), skipSSLVerification)
 	uploader := uploader.New(10*time.Minute, skipSSLVerification, logger)
@@ -346,6 +350,7 @@ func initializeTransformer(
 		workDir,
 		exportNetworkEnvVars,
 		clock,
+		zone,
 	)
 }
 

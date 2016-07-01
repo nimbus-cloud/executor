@@ -34,6 +34,7 @@ var _ = Describe("RunAction", func() {
 	var portMappings []executor.PortMapping
 	var exportNetworkEnvVars bool
 	var fakeClock *fakeclock.FakeClock
+	var zone string
 
 	var spawnedProcess *gfakes.FakeProcess
 	var runError error
@@ -91,6 +92,7 @@ var _ = Describe("RunAction", func() {
 			portMappings,
 			exportNetworkEnvVars,
 			fakeClock,
+			zone,
 		)
 	})
 
@@ -130,6 +132,47 @@ var _ = Describe("RunAction", func() {
 					"test.run-step.process-exit",
 				}))
 
+			})
+
+			Context("when nimbus zoned VCAP_SERVICES service details are provided", func() {
+
+				BeforeEach(func() {
+					json := `{"l2-rabbitmq":[{"name":"rabbit","label":"l2-rabbitmq","tags":["rabbitmq","messaging"],"plan":"default","credentials":{"hemel":{"host":"10.76.62.131","password":"password","port":5672,"uri":"amqp://user:password@10.76.62.131:5672/vhost","username":"user","vhost":"vhost"},"slough":{"host":"10.92.62.131","password":"password","port":5672,"uri":"amqp://user:password@10.92.62.131:5672/vhost","username":"user","vhost":"vhost"}}}]}`
+					vcap := &models.EnvironmentVariable{
+						Name: "VCAP_SERVICES",
+						Value: json,
+					}
+					runAction.Env = append(runAction.Env, vcap)
+				})
+
+				Context("zone is hemel", func() {
+					BeforeEach(func() {
+						zone = "hemel"
+					})
+
+					It("has hemel credentials", func() {
+						_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
+						hemel := `{"l2-rabbitmq":[{"credentials":{"host":"10.76.62.131","password":"password","port":5672,"uri":"amqp://user:password@10.76.62.131:5672/vhost","username":"user","vhost":"vhost"},"label":"l2-rabbitmq","name":"rabbit","plan":"default","tags":["rabbitmq","messaging"]}]}`
+						Expect(spec.Env).To(ContainElement("VCAP_SERVICES=" + hemel))
+						Expect(spec.Env).To(ContainElement("A=1"))
+						Expect(spec.Env).To(ContainElement("B=2"))
+					})
+				})
+
+				Context("zone is slough", func() {
+					BeforeEach(func() {
+						zone = "slough"
+					})
+
+					It("has slough credentials", func() {
+						_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
+						slough := `{"l2-rabbitmq":[{"credentials":{"host":"10.92.62.131","password":"password","port":5672,"uri":"amqp://user:password@10.92.62.131:5672/vhost","username":"user","vhost":"vhost"},"label":"l2-rabbitmq","name":"rabbit","plan":"default","tags":["rabbitmq","messaging"]}]}`
+						Expect(spec.Env).To(ContainElement("VCAP_SERVICES=" + slough))
+						Expect(spec.Env).To(ContainElement("A=1"))
+						Expect(spec.Env).To(ContainElement("B=2"))
+					})
+
+				})
 			})
 		})
 
