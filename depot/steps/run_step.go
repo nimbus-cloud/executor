@@ -203,6 +203,15 @@ func (step *runStep) convertEnvironmentVariables(environmentVariables []*models.
 	for _, env := range environmentVariables {
 		val := step.dezoneVcapServices(env)
 		converted = append(converted, env.Name + "=" + val)
+
+		if isVcapServices(env.Name) {
+			if proxy := step.webProxyFromVcapServices(val); len(proxy) != 0 {
+				converted = append(converted, "WEB_PROXY_HOST=" + proxy["host"])
+				converted = append(converted, "WEB_PROXY_PORT=" + proxy["port"])
+				converted = append(converted, "WEB_PROXY_USER=" + proxy["username"])
+				converted = append(converted, "WEB_PROXY_PASS=" + proxy["password"])
+			}
+		}
 	}
 
 	return converted
@@ -210,14 +219,14 @@ func (step *runStep) convertEnvironmentVariables(environmentVariables []*models.
 
 func (step *runStep) dezoneVcapServices(env *models.EnvironmentVariable) string {
 
-	if env.Name == "VCAP_SERVICES" {
-		return step.checkIfZonedConfig(env.Value)
+	if isVcapServices(env.Name) {
+		return step.checkIfZonedAndDeZone(env.Value)
 	}
 
 	return env.Value
 }
 
-func (step *runStep) checkIfZonedConfig(vcapServicesJson string) string {
+func (step *runStep) checkIfZonedAndDeZone(vcapServicesJson string) string {
 
 	var parsed map[string]interface{}
 
@@ -228,18 +237,12 @@ func (step *runStep) checkIfZonedConfig(vcapServicesJson string) string {
 	}
 
 	for _, v := range parsed {
-		vv, ok := v.([]interface{})
-		if ok {
-			vvv, ok := vv[0].(map[string]interface{})
-			if ok {
-				creds, ok := vvv["credentials"].(map[string]interface{})
-				if ok {
-					if val, ok := creds[step.zone]; ok {
-						// replace zoned credentials with details for the zone we are in
-						vvv["credentials"] = val
-					}
-				}
-			}
+		vv := v.([]interface{})
+		vvv := vv[0].(map[string]interface{})
+		creds := vvv["credentials"].(map[string]interface{})
+		if val, ok := creds[step.zone]; ok {
+			// replace zoned credentials with details for the zone we are in
+			vvv["credentials"] = val
 		}
 	}
 
@@ -250,6 +253,36 @@ func (step *runStep) checkIfZonedConfig(vcapServicesJson string) string {
 	}
 
 	return string(data)
+}
+
+func isVcapServices(name string) bool {
+	return name == "VCAP_SERVICES"
+}
+
+func (step *runStep) webProxyFromVcapServices(vcapServicesJson string) (map[string]string) {
+
+	var parsed map[string]interface{}
+	proxy := make(map[string]string)
+
+	err := json.Unmarshal([]byte(vcapServicesJson), &parsed)
+	if err != nil {
+		step.logger.Error("error-parsing-proxy-vcap-services-json", err)
+		return proxy
+	}
+
+	for _, v := range parsed {
+		vv := v.([]interface{})
+		vvv := vv[0].(map[string]interface{})
+		if vvv["label"] != nil && vvv["label"].(string) == "proxy" {
+			creds := vvv["credentials"].(map[string]interface{})
+			proxy["host"] = creds["host"].(string)
+			proxy["port"] = fmt.Sprintf("%.0f", creds["port"].(float64))
+			proxy["username"] = creds["username"].(string)
+			proxy["password"] = creds["password"].(string)
+		}
+	}
+
+	return proxy
 }
 
 func (step *runStep) networkingEnvVars() []string {

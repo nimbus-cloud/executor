@@ -174,6 +174,53 @@ var _ = Describe("RunAction", func() {
 
 				})
 			})
+
+			Context("when nimbus zoned VCAP_SERVICES proxy service details are provided", func() {
+
+				BeforeEach(func() {
+					json := `{"proxy":[{"credentials":{"hemel":{"host":"hem-ct-proxycluster-m-vip-001.test-01.test-paas.bskyb.com","http_proxy":"http://user:password@hem-ct-proxycluster-m-vip-001.test-01.test-paas.bskyb.com:3128","password":"password","port":3128,"username":"user"},"slough":{"host":"slu-ct-proxycluster-m-vip-001.test-01.test-paas.bskyb.com","http_proxy":"http://user:password@slu-ct-proxycluster-m-vip-001.test-01.test-paas.bskyb.com:3128","password":"password","port":3128,"username":"user"}},"label":"proxy","name":"proxy","plan":"default","tags":["proxy","http"]}]}`
+					vcap := &models.EnvironmentVariable{
+						Name: "VCAP_SERVICES",
+						Value: json,
+					}
+					runAction.Env = append(runAction.Env, vcap)
+				})
+
+				Context("zone is hemel", func() {
+					BeforeEach(func() {
+						zone = "hemel"
+					})
+
+					It("has hemel credentials", func() {
+						_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
+						hemel := `{"proxy":[{"credentials":{"host":"hem-ct-proxycluster-m-vip-001.test-01.test-paas.bskyb.com","http_proxy":"http://user:password@hem-ct-proxycluster-m-vip-001.test-01.test-paas.bskyb.com:3128","password":"password","port":3128,"username":"user"},"label":"proxy","name":"proxy","plan":"default","tags":["proxy","http"]}]}`
+						Expect(spec.Env).To(ContainElement("VCAP_SERVICES=" + hemel))
+						Expect(spec.Env).To(ContainElement("WEB_PROXY_HOST=hem-ct-proxycluster-m-vip-001.test-01.test-paas.bskyb.com"))
+						Expect(spec.Env).To(ContainElement("WEB_PROXY_PORT=3128"))
+						Expect(spec.Env).To(ContainElement("WEB_PROXY_USER=user"))
+						Expect(spec.Env).To(ContainElement("WEB_PROXY_PASS=password"))
+					})
+				})
+
+				Context("zone is slough", func() {
+					BeforeEach(func() {
+						zone = "slough"
+					})
+
+					It("has slough credentials", func() {
+						_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
+						slough := `{"proxy":[{"credentials":{"host":"slu-ct-proxycluster-m-vip-001.test-01.test-paas.bskyb.com","http_proxy":"http://user:password@slu-ct-proxycluster-m-vip-001.test-01.test-paas.bskyb.com:3128","password":"password","port":3128,"username":"user"},"label":"proxy","name":"proxy","plan":"default","tags":["proxy","http"]}]}`
+						Expect(spec.Env).To(ContainElement("VCAP_SERVICES="+slough))
+						Expect(spec.Env).To(ContainElement("WEB_PROXY_HOST=slu-ct-proxycluster-m-vip-001.test-01.test-paas.bskyb.com"))
+						Expect(spec.Env).To(ContainElement("WEB_PROXY_PORT=3128"))
+						Expect(spec.Env).To(ContainElement("WEB_PROXY_USER=user"))
+						Expect(spec.Env).To(ContainElement("WEB_PROXY_PASS=password"))
+					})
+
+				})
+			})
+
+
 		})
 
 		Context("when the script fails", func() {
