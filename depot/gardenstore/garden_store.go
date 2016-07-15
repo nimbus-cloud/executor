@@ -266,7 +266,7 @@ func (store *GardenStore) Run(logger lager.Logger, container executor.Container)
 		container.LogConfig.Index,
 	)
 
-	var setupStep, actionStep, monitorStep steps.Step
+	var setupStep, actionStep, monitorStep, nimbusFirewallsStep steps.Step
 
 	if container.Setup != nil {
 		setupStep = store.transformer.StepFor(
@@ -276,6 +276,13 @@ func (store *GardenStore) Run(logger lager.Logger, container executor.Container)
 			container.ExternalIP,
 			container.Ports,
 			logger.Session("setup"),
+		)
+
+		nimbusFirewallsStep = steps.NewNimbusFirewalls(
+			gardenContainer,
+			logStreamer,
+			logger.Session("nimbus-firewalls"),
+			"test",
 		)
 	}
 
@@ -325,7 +332,7 @@ func (store *GardenStore) Run(logger lager.Logger, container executor.Container)
 
 	var step steps.Step
 	if setupStep != nil {
-		step = steps.NewSerial([]steps.Step{setupStep, longLivedAction})
+		step = steps.NewSerial([]steps.Step{setupStep, nimbusFirewallsStep, longLivedAction})
 	} else {
 		step = longLivedAction
 	}
