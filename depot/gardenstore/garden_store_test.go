@@ -68,6 +68,7 @@ var _ = Describe("GardenContainerStore", func() {
 			clock,
 			emitter,
 			100,
+			"test",
 		)
 		Expect(err).NotTo(HaveOccurred())
 	})

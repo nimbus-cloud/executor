@@ -18,21 +18,21 @@ type nimbusFirewallsStep struct {
 	container            garden.Container
 	streamer             log_streamer.LogStreamer
 	logger               lager.Logger
-	env	             string		// test|dev|stage|prod
+	firewallEnv	     string		// test|dev|stage|prod
 }
 
 func NewNimbusFirewalls(
 container garden.Container,
 streamer log_streamer.LogStreamer,
 logger lager.Logger,
-env string,
+firewallEnv string,
 ) *nimbusFirewallsStep {
 	logger = logger.Session("nimbus-firewalls-step")
 	return &nimbusFirewallsStep{
 		container:            container,
 		streamer:             streamer,
 		logger:               logger,
-		env:                  "test", 	// TODO: inject
+		firewallEnv:          firewallEnv,
 	}
 }
 
@@ -42,7 +42,7 @@ func (step *nimbusFirewallsStep) Perform() error {
 	step.logger.Info("nimbus firewalls")
 
 	for _, configFolder := range configFolders {
-		backends := step.parseConfig(configFolder, step.env)
+		backends := step.parseConfig(configFolder, step.firewallEnv)
 		if backends != nil {
 			step.processBackends(backends)
 		}

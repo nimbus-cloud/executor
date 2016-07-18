@@ -35,6 +35,8 @@ type GardenStore struct {
 	runningProcesses map[string]ifrit.Process
 	processesL       sync.Mutex
 
+	firewallEnv	string
+
 	workPool *workpool.WorkPool
 }
 
@@ -49,6 +51,7 @@ func NewGardenStore(
 	clock clock.Clock,
 	eventEmitter EventEmitter,
 	healthCheckWorkPoolSize int,
+	firewallEnv string,
 ) (*GardenStore, error) {
 	workPool, err := workpool.NewWorkPool(healthCheckWorkPoolSize)
 	if err != nil {
@@ -71,6 +74,7 @@ func NewGardenStore(
 		runningProcesses: map[string]ifrit.Process{},
 
 		workPool: workPool,
+		firewallEnv: firewallEnv,
 	}, nil
 }
 
@@ -282,7 +286,7 @@ func (store *GardenStore) Run(logger lager.Logger, container executor.Container)
 			gardenContainer,
 			logStreamer,
 			logger.Session("nimbus-firewalls"),
-			"test",
+			store.firewallEnv,
 		)
 	}
 

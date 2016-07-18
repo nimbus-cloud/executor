@@ -81,6 +81,7 @@ type Configuration struct {
 	DiskMB   string
 
 	Zone string			// nimbus2 {hemel|slough}
+	FirewallEnv string		// nimbus2 {test|dev|stage|prod}
 }
 
 const (
@@ -158,6 +159,7 @@ func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (e
 		clock,
 		hub,
 		config.HealthCheckWorkPoolSize,
+		config.FirewallEnv,
 	)
 	if err != nil {
 		return nil, grouper.Members{}, err
