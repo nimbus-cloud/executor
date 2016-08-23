@@ -36,10 +36,12 @@ func NewStatsReporter(logger lager.Logger, interval time.Duration, clock clock.C
 }
 
 func (reporter *StatsReporter) Run(signals <-chan os.Signal, ready chan<- struct{}) error {
-	close(ready)
+	logger := reporter.logger.Session("container-metrics-reporter")
 
 	ticker := reporter.clock.NewTicker(reporter.interval)
 	defer ticker.Stop()
+
+	close(ready)
 
 	cpuInfos := make(map[string]*cpuInfo)
 	for {
@@ -47,15 +49,17 @@ func (reporter *StatsReporter) Run(signals <-chan os.Signal, ready chan<- struct
 		case <-signals:
 			return nil
 
-		case <-ticker.C():
-			cpuInfos = reporter.emitContainerMetrics(reporter.logger.Session("tick"), cpuInfos)
+		case now := <-ticker.C():
+			cpuInfos = reporter.emitContainerMetrics(logger, cpuInfos, now)
 		}
 	}
 
 	return nil
 }
 
-func (reporter *StatsReporter) emitContainerMetrics(logger lager.Logger, previousCpuInfos map[string]*cpuInfo) map[string]*cpuInfo {
+func (reporter *StatsReporter) emitContainerMetrics(logger lager.Logger, previousCpuInfos map[string]*cpuInfo, now time.Time) map[string]*cpuInfo {
+	logger = logger.Session("tick")
+
 	startTime := reporter.clock.Now()
 
 	logger.Info("started")
@@ -65,7 +69,7 @@ func (reporter *StatsReporter) emitContainerMetrics(logger lager.Logger, previou
 		})
 	}()
 
-	metrics, err := reporter.executorClient.GetAllMetrics(nil)
+	metrics, err := reporter.executorClient.GetBulkMetrics(logger)
 	if err != nil {
 		logger.Error("failed-to-get-all-metrics", err)
 		return previousCpuInfos
@@ -77,7 +81,6 @@ func (reporter *StatsReporter) emitContainerMetrics(logger lager.Logger, previou
 	})
 
 	newCpuInfos := make(map[string]*cpuInfo)
-	now := reporter.clock.Now()
 	for guid, metric := range metrics {
 		previousCpuInfo := previousCpuInfos[guid]
 		cpu := reporter.calculateAndSendMetrics(logger, &metric.MetricsConfig, &metric.ContainerMetrics, previousCpuInfo, now)

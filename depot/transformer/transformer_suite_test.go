@@ -1,4 +1,4 @@
-package keyed_lock_test
+package transformer_test
 
 import (
 	. "github.com/onsi/ginkgo"
@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestKeyedLock(t *testing.T) {
+func TestTransformer(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "KeyedLock Suite")
+	RunSpecs(t, "Transformer Suite")
 }

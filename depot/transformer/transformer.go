@@ -12,15 +12,24 @@ import (
 	"github.com/cloudfoundry-incubator/executor/depot/steps"
 	"github.com/cloudfoundry-incubator/executor/depot/uploader"
 	"github.com/cloudfoundry-incubator/garden"
+	"github.com/cloudfoundry/gunk/workpool"
 	"github.com/pivotal-golang/archiver/compressor"
 	"github.com/pivotal-golang/archiver/extractor"
 	"github.com/pivotal-golang/clock"
 	"github.com/pivotal-golang/lager"
+	"github.com/tedsuo/ifrit"
 )
 
 var ErrNoCheck = errors.New("no check configured")
 
-type Transformer struct {
+//go:generate counterfeiter -o faketransformer/fake_transformer.go . Transformer
+
+type Transformer interface {
+	StepFor(log_streamer.LogStreamer, *models.Action, garden.Container, string, []executor.PortMapping, lager.Logger) steps.Step
+	StepsRunner(lager.Logger, executor.Container, garden.Container, log_streamer.LogStreamer) (ifrit.Runner, error)
+}
+
+type transformer struct {
 	cachedDownloader     cacheddownloader.CachedDownloader
 	uploader             uploader.Uploader
 	extractor            extractor.Extractor
@@ -30,7 +39,16 @@ type Transformer struct {
 	tempDir              string
 	exportNetworkEnvVars bool
 	clock                clock.Clock
+
+	postSetupHook []string
+	postSetupUser string
+
+	healthyMonitoringInterval   time.Duration
+	unhealthyMonitoringInterval time.Duration
+	healthCheckWorkPool         *workpool.WorkPool
+
 	zone		     string
+	firewallEnv 	     string
 }
 
 func NewTransformer(
@@ -42,24 +60,36 @@ func NewTransformer(
 	uploadLimiter chan struct{},
 	tempDir string,
 	exportNetworkEnvVars bool,
+	healthyMonitoringInterval time.Duration,
+	unhealthyMonitoringInterval time.Duration,
+	healthCheckWorkPool *workpool.WorkPool,
 	clock clock.Clock,
+	postSetupHook []string,
+	postSetupUser string,
 	zone string,
-) *Transformer {
-	return &Transformer{
-		cachedDownloader:     cachedDownloader,
-		uploader:             uploader,
-		extractor:            extractor,
-		compressor:           compressor,
-		downloadLimiter:      downloadLimiter,
-		uploadLimiter:        uploadLimiter,
-		tempDir:              tempDir,
-		exportNetworkEnvVars: exportNetworkEnvVars,
-		clock:                clock,
-		zone: 		      zone,
+	firewallEnv string,
+) *transformer {
+	return &transformer{
+		cachedDownloader:            cachedDownloader,
+		uploader:                    uploader,
+		extractor:                   extractor,
+		compressor:                  compressor,
+		downloadLimiter:             downloadLimiter,
+		uploadLimiter:               uploadLimiter,
+		tempDir:                     tempDir,
+		exportNetworkEnvVars:        exportNetworkEnvVars,
+		healthyMonitoringInterval:   healthyMonitoringInterval,
+		unhealthyMonitoringInterval: unhealthyMonitoringInterval,
+		healthCheckWorkPool:         healthCheckWorkPool,
+		clock:                       clock,
+		postSetupHook:               postSetupHook,
+		postSetupUser:               postSetupUser,
+		zone: 		      	     zone,
+		firewallEnv:		     firewallEnv,
 	}
 }
 
-func (transformer *Transformer) StepFor(
+func (t *transformer) StepFor(
 	logStreamer log_streamer.LogStreamer,
 	action *models.Action,
 	container garden.Container,
@@ -67,7 +97,6 @@ func (transformer *Transformer) StepFor(
 	ports []executor.PortMapping,
 	logger lager.Logger,
 ) steps.Step {
-
 	a := action.GetValue()
 	switch actionModel := a.(type) {
 	case *models.RunAction:
@@ -78,17 +107,17 @@ func (transformer *Transformer) StepFor(
 			logger,
 			externalIP,
 			ports,
-			transformer.exportNetworkEnvVars,
-			transformer.clock,
-			transformer.zone,
+			t.exportNetworkEnvVars,
+			t.clock,
+			t.zone,
 		)
 
 	case *models.DownloadAction:
 		return steps.NewDownload(
 			container,
 			*actionModel,
-			transformer.cachedDownloader,
-			transformer.downloadLimiter,
+			t.cachedDownloader,
+			t.downloadLimiter,
 			logStreamer.WithSource(actionModel.LogSource),
 			logger,
 		)
@@ -97,17 +126,17 @@ func (transformer *Transformer) StepFor(
 		return steps.NewUpload(
 			container,
 			*actionModel,
-			transformer.uploader,
-			transformer.compressor,
-			transformer.tempDir,
+			t.uploader,
+			t.compressor,
+			t.tempDir,
 			logStreamer.WithSource(actionModel.LogSource),
-			transformer.uploadLimiter,
+			t.uploadLimiter,
 			logger,
 		)
 
 	case *models.EmitProgressAction:
 		return steps.NewEmitProgress(
-			transformer.StepFor(
+			t.StepFor(
 				logStreamer,
 				actionModel.Action,
 				container,
@@ -124,7 +153,7 @@ func (transformer *Transformer) StepFor(
 
 	case *models.TimeoutAction:
 		return steps.NewTimeout(
-			transformer.StepFor(
+			t.StepFor(
 				logStreamer.WithSource(actionModel.LogSource),
 				actionModel.Action,
 				container,
@@ -138,7 +167,7 @@ func (transformer *Transformer) StepFor(
 
 	case *models.TryAction:
 		return steps.NewTry(
-			transformer.StepFor(
+			t.StepFor(
 				logStreamer.WithSource(actionModel.LogSource),
 				actionModel.Action,
 				container,
@@ -152,7 +181,7 @@ func (transformer *Transformer) StepFor(
 	case *models.ParallelAction:
 		subSteps := make([]steps.Step, len(actionModel.Actions))
 		for i, action := range actionModel.Actions {
-			subSteps[i] = transformer.StepFor(
+			subSteps[i] = t.StepFor(
 				logStreamer.WithSource(actionModel.LogSource),
 				action,
 				container,
@@ -166,7 +195,7 @@ func (transformer *Transformer) StepFor(
 	case *models.CodependentAction:
 		subSteps := make([]steps.Step, len(actionModel.Actions))
 		for i, action := range actionModel.Actions {
-			subSteps[i] = transformer.StepFor(
+			subSteps[i] = t.StepFor(
 				logStreamer.WithSource(actionModel.LogSource),
 				action,
 				container,
@@ -181,7 +210,7 @@ func (transformer *Transformer) StepFor(
 	case *models.SerialAction:
 		subSteps := make([]steps.Step, len(actionModel.Actions))
 		for i, action := range actionModel.Actions {
-			subSteps[i] = transformer.StepFor(
+			subSteps[i] = t.StepFor(
 				logStreamer,
 				action,
 				container,
@@ -194,4 +223,111 @@ func (transformer *Transformer) StepFor(
 	}
 
 	panic(fmt.Sprintf("unknown action: %T", action))
+}
+
+func (t *transformer) StepsRunner(
+	logger lager.Logger,
+	container executor.Container,
+	gardenContainer garden.Container,
+	logStreamer log_streamer.LogStreamer,
+) (ifrit.Runner, error) {
+	var setup, action, postSetup, monitor, nimbusFirewallsStep steps.Step
+	if container.Setup != nil {
+		setup = t.StepFor(
+			logStreamer,
+			container.Setup,
+			gardenContainer,
+			container.ExternalIP,
+			container.Ports,
+			logger.Session("setup"),
+		)
+
+		nimbusFirewallsStep = steps.NewNimbusFirewalls(
+			gardenContainer,
+			logStreamer,
+			logger.Session("nimbus-firewalls"),
+			t.firewallEnv,
+		)
+	}
+
+	if len(t.postSetupHook) > 0 {
+		actionModel := models.RunAction{
+			Path: t.postSetupHook[0],
+			Args: t.postSetupHook[1:],
+			User: t.postSetupUser,
+		}
+		postSetup = steps.NewRun(
+			gardenContainer,
+			actionModel,
+			log_streamer.NewNoopStreamer(),
+			logger,
+			container.ExternalIP,
+			container.Ports,
+			t.exportNetworkEnvVars,
+			t.clock,
+		)
+	}
+
+	if container.Action == nil {
+		err := errors.New("container cannot have empty action")
+		logger.Error("steps-runner-empty-action", err)
+		return nil, err
+	}
+
+	action = t.StepFor(
+		logStreamer,
+		container.Action,
+		gardenContainer,
+		container.ExternalIP,
+		container.Ports,
+		logger.Session("action"),
+	)
+
+	hasStartedRunning := make(chan struct{}, 1)
+
+	if container.Monitor != nil {
+		monitor = steps.NewMonitor(
+			func() steps.Step {
+				return t.StepFor(
+					logStreamer,
+					container.Monitor,
+					gardenContainer,
+					container.ExternalIP,
+					container.Ports,
+					logger.Session("monitor-run"),
+				)
+			},
+			hasStartedRunning,
+			logger.Session("monitor"),
+			t.clock,
+			logStreamer,
+			time.Duration(container.StartTimeout)*time.Second,
+			t.healthyMonitoringInterval,
+			t.unhealthyMonitoringInterval,
+			t.healthCheckWorkPool,
+		)
+	}
+
+	var longLivedAction steps.Step
+	if monitor != nil {
+		longLivedAction = steps.NewCodependent([]steps.Step{action, monitor}, false)
+	} else {
+		longLivedAction = action
+
+		// this container isn't monitored, so we mark it running right away
+		hasStartedRunning <- struct{}{}
+	}
+
+	var step steps.Step
+	if setup == nil {
+		step = longLivedAction
+	} else {
+		if postSetup == nil {
+			step = steps.NewSerial([]steps.Step{setup, nimbusFirewallsStep, longLivedAction})
+		} else {
+			step = steps.NewSerial([]steps.Step{setup, postSetup, nimbusFirewallsStep, longLivedAction})
+		}
+	}
+
+	return newStepRunner(step, hasStartedRunning), nil
 }

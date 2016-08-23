@@ -1,4 +1,4 @@
-package allocationstore_test
+package gardenhealth_test
 
 import (
 	. "github.com/onsi/ginkgo"
@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestAllocationstore(t *testing.T) {
+func TestHealthState(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Allocationstore Suite")
+	RunSpecs(t, "HealthState Suite")
 }

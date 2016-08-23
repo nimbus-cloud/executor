@@ -19,9 +19,15 @@ const (
 	StateRunning      State = "running"
 	StateCompleted    State = "completed"
 )
+
 const (
 	ExclusiveDiskLimit DiskLimitScope = iota
 	TotalDiskLimit     DiskLimitScope = iota
+)
+
+const (
+	HealthcheckTag      = "executor-healthcheck"
+	HealthcheckTagValue = "executor-healthcheck"
 )
 
 type Container struct {
@@ -41,6 +47,75 @@ func NewContainerFromResource(guid string, resource *Resource, tags Tags) Contai
 		Resource: *resource,
 		Tags:     tags,
 	}
+}
+
+func (c *Container) ValidateTransitionTo(newState State) bool {
+	if newState == StateCompleted {
+		return true
+	}
+	switch c.State {
+	case StateReserved:
+		return newState == StateInitializing
+	case StateInitializing:
+		return newState == StateCreated
+	case StateCreated:
+		return newState == StateRunning
+	default:
+		return false
+	}
+}
+
+func (c *Container) TransistionToInitialize(req *RunRequest) error {
+	if !c.ValidateTransitionTo(StateInitializing) {
+		return ErrInvalidTransition
+	}
+	c.State = StateInitializing
+	c.RunInfo = req.RunInfo
+	c.Tags.Add(req.Tags)
+	return nil
+}
+
+func (c *Container) TransistionToCreate() error {
+	if !c.ValidateTransitionTo(StateCreated) {
+		return ErrInvalidTransition
+	}
+
+	c.State = StateCreated
+	return nil
+}
+
+func (c *Container) TransitionToComplete(failed bool, failureReason string) {
+	c.RunResult.Failed = failed
+	c.RunResult.FailureReason = failureReason
+	c.State = StateCompleted
+}
+
+func (newContainer Container) Copy() Container {
+	newContainer.Tags = newContainer.Tags.Copy()
+	return newContainer
+}
+
+func (c *Container) IsCreated() bool {
+	return c.State != StateReserved && c.State != StateInitializing && c.State != StateCompleted
+}
+
+func (c *Container) HasTags(tags Tags) bool {
+	if c.Tags == nil {
+		return tags == nil
+	}
+
+	if tags == nil {
+		return false
+	}
+
+	for key, val := range tags {
+		v, ok := c.Tags[key]
+		if !ok || val != v {
+			return false
+		}
+	}
+
+	return true
 }
 
 func NewReservedContainerFromAllocationRequest(req *AllocationRequest, allocatedAt int64) Container {
@@ -64,43 +139,45 @@ func NewResource(memoryMB, diskMB int, rootFSPath string) Resource {
 	}
 }
 
+type CachedDependency struct {
+	Name      string `json:"name"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	CacheKey  string `json:"cache_key"`
+	LogSource string `json:"log_source"`
+}
+
 type RunInfo struct {
-	CPUWeight     uint                        `json:"cpu_weight"`
-	DiskScope     DiskLimitScope              `json:"disk_scope,omitempty"`
-	Ports         []PortMapping               `json:"ports"`
-	LogConfig     LogConfig                   `json:"log_config"`
-	MetricsConfig MetricsConfig               `json:"metrics_config"`
-	StartTimeout  uint                        `json:"start_timeout"`
-	Privileged    bool                        `json:"privileged"`
-	Setup         *models.Action              `json:"setup"`
-	Action        *models.Action              `json:"run"`
-	Monitor       *models.Action              `json:"monitor"`
-	EgressRules   []*models.SecurityGroupRule `json:"egress_rules,omitempty"`
-	Env           []EnvironmentVariable       `json:"env,omitempty"`
+	CPUWeight                     uint                        `json:"cpu_weight"`
+	DiskScope                     DiskLimitScope              `json:"disk_scope,omitempty"`
+	Ports                         []PortMapping               `json:"ports"`
+	LogConfig                     LogConfig                   `json:"log_config"`
+	MetricsConfig                 MetricsConfig               `json:"metrics_config"`
+	StartTimeout                  uint                        `json:"start_timeout"`
+	Privileged                    bool                        `json:"privileged"`
+	CachedDependencies            []CachedDependency          `json:"cached_dependencies"`
+	Setup                         *models.Action              `json:"setup"`
+	Action                        *models.Action              `json:"run"`
+	Monitor                       *models.Action              `json:"monitor"`
+	EgressRules                   []*models.SecurityGroupRule `json:"egress_rules,omitempty"`
+	Env                           []EnvironmentVariable       `json:"env,omitempty"`
+	TrustedSystemCertificatesPath string                      `json:"trusted_system_certificates_path,omitempty"`
+	VolumeMounts                  []VolumeMount               `json:"volume_mounts"`
 }
 
-func (newContainer Container) Copy() Container {
-	newContainer.Tags = newContainer.Tags.Copy()
-	return newContainer
-}
+type BindMountMode uint8
 
-func (c *Container) HasTags(tags Tags) bool {
-	if c.Tags == nil {
-		return tags == nil
-	}
+const (
+	BindMountModeRO BindMountMode = 0
+	BindMountModeRW BindMountMode = 1
+)
 
-	if tags == nil {
-		return false
-	}
-
-	for key, val := range tags {
-		v, ok := c.Tags[key]
-		if !ok || val != v {
-			return false
-		}
-	}
-
-	return true
+type VolumeMount struct {
+	Driver        string                 `json:"driver"`
+	VolumeId      string                 `json:"volume_id"`
+	Config        map[string]interface{} `json:"config"`
+	ContainerPath string                 `json:"container_path"`
+	Mode          BindMountMode          `json:"mode"`
 }
 
 type InnerContainer Container
@@ -166,6 +243,10 @@ func NewExecutorResources(memoryMB, diskMB, containers int) ExecutorResources {
 	}
 }
 
+func (e ExecutorResources) Copy() ExecutorResources {
+	return e
+}
+
 func (r *ExecutorResources) canSubtract(res *Resource) bool {
 	return r.MemoryMB >= res.MemoryMB && r.DiskMB >= res.DiskMB && r.Containers > 0
 }
@@ -178,6 +259,12 @@ func (r *ExecutorResources) Subtract(res *Resource) bool {
 	r.DiskMB -= res.DiskMB
 	r.Containers -= 1
 	return true
+}
+
+func (r *ExecutorResources) Add(res *Resource) {
+	r.MemoryMB += res.MemoryMB
+	r.DiskMB += res.DiskMB
+	r.Containers += 1
 }
 
 type Tags map[string]string

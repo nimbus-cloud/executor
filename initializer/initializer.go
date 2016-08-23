@@ -10,18 +10,21 @@ import (
 	"github.com/cloudfoundry-incubator/executor"
 	"github.com/cloudfoundry-incubator/executor/containermetrics"
 	"github.com/cloudfoundry-incubator/executor/depot"
-	"github.com/cloudfoundry-incubator/executor/depot/allocationstore"
+	"github.com/cloudfoundry-incubator/executor/depot/containerstore"
 	"github.com/cloudfoundry-incubator/executor/depot/event"
-	"github.com/cloudfoundry-incubator/executor/depot/gardenstore"
-	"github.com/cloudfoundry-incubator/executor/depot/keyed_lock"
 	"github.com/cloudfoundry-incubator/executor/depot/metrics"
 	"github.com/cloudfoundry-incubator/executor/depot/transformer"
 	"github.com/cloudfoundry-incubator/executor/depot/uploader"
+	"github.com/cloudfoundry-incubator/executor/gardenhealth"
+	"github.com/cloudfoundry-incubator/executor/guidgen"
 	"github.com/cloudfoundry-incubator/executor/initializer/configuration"
 	"github.com/cloudfoundry-incubator/garden"
 	GardenClient "github.com/cloudfoundry-incubator/garden/client"
 	GardenConnection "github.com/cloudfoundry-incubator/garden/client/connection"
 	"github.com/cloudfoundry-incubator/runtime-schema/metric"
+	"github.com/cloudfoundry-incubator/volman/vollocal"
+	"github.com/cloudfoundry/gunk/workpool"
+	"github.com/google/shlex"
 	"github.com/pivotal-golang/archiver/compressor"
 	"github.com/pivotal-golang/archiver/extractor"
 	"github.com/pivotal-golang/clock"
@@ -46,7 +49,7 @@ type executorContainers struct {
 
 func (containers *executorContainers) Containers() ([]garden.Container, error) {
 	return containers.gardenClient.Containers(garden.Properties{
-		gardenstore.ContainerOwnerProperty: containers.owner,
+		containerstore.ContainerOwnerProperty: containers.owner,
 	})
 }
 
@@ -54,13 +57,16 @@ type Configuration struct {
 	GardenNetwork string
 	GardenAddr    string
 
-	ContainerOwnerName string
+	ContainerOwnerName            string
+	HealthCheckContainerOwnerName string
 
 	TempDir              string
 	CachePath            string
 	MaxCacheSizeInBytes  uint64
 	SkipCertVerify       bool
 	ExportNetworkEnvVars bool
+
+	VolmanDriverPath string
 
 	ContainerMaxCpuShares       uint64
 	ContainerInodeLimit         uint64
@@ -75,10 +81,27 @@ type Configuration struct {
 	ReadWorkPoolSize    int
 	MetricsWorkPoolSize int
 
-	RegistryPruningInterval time.Duration
+	ReservedExpirationTime time.Duration
+	ContainerReapInterval  time.Duration
+
+	GardenHealthcheckRootFS            string
+	GardenHealthcheckInterval          time.Duration
+	GardenHealthcheckTimeout           time.Duration
+	GardenHealthcheckCommandRetryPause time.Duration
+
+	GardenHealthcheckProcessPath string
+	GardenHealthcheckProcessArgs []string
+	GardenHealthcheckProcessUser string
+	GardenHealthcheckProcessEnv  []string
+	GardenHealthcheckProcessDir  string
 
 	MemoryMB string
 	DiskMB   string
+
+	PostSetupHook string
+	PostSetupUser string
+
+	TrustedSystemCertificatesPath string
 
 	Zone string			// nimbus2 {hemel|slough}
 	FirewallEnv string		// nimbus2 {test|dev|stage|prod}
@@ -94,32 +117,45 @@ const (
 )
 
 var DefaultConfiguration = Configuration{
-	GardenNetwork:               "unix",
-	GardenAddr:                  "/tmp/garden.sock",
-	MemoryMB:                    configuration.Automatic,
-	DiskMB:                      configuration.Automatic,
-	TempDir:                     "/tmp",
-	RegistryPruningInterval:     time.Minute,
-	ContainerInodeLimit:         200000,
-	ContainerMaxCpuShares:       0,
-	CachePath:                   "/tmp/cache",
-	MaxCacheSizeInBytes:         10 * 1024 * 1024 * 1024,
-	SkipCertVerify:              false,
-	HealthyMonitoringInterval:   30 * time.Second,
-	UnhealthyMonitoringInterval: 500 * time.Millisecond,
-	ExportNetworkEnvVars:        false,
-	ContainerOwnerName:          "executor",
-	CreateWorkPoolSize:          defaultCreateWorkPoolSize,
-	DeleteWorkPoolSize:          defaultDeleteWorkPoolSize,
-	ReadWorkPoolSize:            defaultReadWorkPoolSize,
-	MetricsWorkPoolSize:         defaultMetricsWorkPoolSize,
-	HealthCheckWorkPoolSize:     defaultHealthCheckWorkPoolSize,
-	MaxConcurrentDownloads:      defaultMaxConcurrentDownloads,
+	GardenNetwork:                      "unix",
+	GardenAddr:                         "/tmp/garden.sock",
+	MemoryMB:                           configuration.Automatic,
+	DiskMB:                             configuration.Automatic,
+	TempDir:                            "/tmp",
+	ReservedExpirationTime:             time.Minute,
+	ContainerReapInterval:              time.Minute,
+	ContainerInodeLimit:                200000,
+	ContainerMaxCpuShares:              0,
+	CachePath:                          "/tmp/cache",
+	MaxCacheSizeInBytes:                10 * 1024 * 1024 * 1024,
+	SkipCertVerify:                     false,
+	HealthyMonitoringInterval:          30 * time.Second,
+	UnhealthyMonitoringInterval:        500 * time.Millisecond,
+	ExportNetworkEnvVars:               false,
+	ContainerOwnerName:                 "executor",
+	HealthCheckContainerOwnerName:      "executor-health-check",
+	CreateWorkPoolSize:                 defaultCreateWorkPoolSize,
+	DeleteWorkPoolSize:                 defaultDeleteWorkPoolSize,
+	ReadWorkPoolSize:                   defaultReadWorkPoolSize,
+	MetricsWorkPoolSize:                defaultMetricsWorkPoolSize,
+	HealthCheckWorkPoolSize:            defaultHealthCheckWorkPoolSize,
+	MaxConcurrentDownloads:             defaultMaxConcurrentDownloads,
+	GardenHealthcheckInterval:          10 * time.Minute,
+	GardenHealthcheckTimeout:           10 * time.Minute,
+	GardenHealthcheckCommandRetryPause: time.Second,
+	GardenHealthcheckProcessArgs:       []string{},
+	GardenHealthcheckProcessEnv:        []string{},
 }
 
 func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (executor.Client, grouper.Members, error) {
+	postSetupHook, err := shlex.Split(config.PostSetupHook)
+	if err != nil {
+		logger.Error("failed-to-parse-post-setup-hook", err)
+		return nil, grouper.Members{}, err
+	}
+
 	gardenClient := GardenClient.New(GardenConnection.New(config.GardenNetwork, config.GardenAddr))
-	err := waitForGarden(logger, gardenClient, clock)
+	err = waitForGarden(logger, gardenClient, clock)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -133,39 +169,63 @@ func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (e
 
 	workDir := setupWorkDir(logger, config.TempDir)
 
-	transformer := initializeTransformer(
-		logger,
-		config.CachePath,
-		workDir,
-		config.MaxCacheSizeInBytes,
-		uint(config.MaxConcurrentDownloads),
-		maxConcurrentUploads,
-		config.SkipCertVerify,
-		config.ExportNetworkEnvVars,
-		clock,
-		config.Zone,
-	)
-
-	hub := event.NewHub()
-
-	gardenStore, err := gardenstore.NewGardenStore(
-		gardenClient,
-		config.ContainerOwnerName,
-		config.ContainerMaxCpuShares,
-		config.ContainerInodeLimit,
-		config.HealthyMonitoringInterval,
-		config.UnhealthyMonitoringInterval,
-		transformer,
-		clock,
-		hub,
-		config.HealthCheckWorkPoolSize,
-		config.FirewallEnv,
-	)
+	healthCheckWorkPool, err := workpool.NewWorkPool(config.HealthCheckWorkPoolSize)
 	if err != nil {
 		return nil, grouper.Members{}, err
 	}
 
-	allocationStore := allocationstore.NewAllocationStore(clock, hub)
+	cache := cacheddownloader.New(
+		config.CachePath,
+		workDir,
+		int64(config.MaxCacheSizeInBytes),
+		10*time.Minute,
+		int(math.MaxInt8),
+		config.SkipCertVerify,
+		cacheddownloader.TarTransform,
+	)
+
+	transformer := initializeTransformer(
+		logger,
+		cache,
+		workDir,
+		uint(config.MaxConcurrentDownloads),
+		maxConcurrentUploads,
+		config.SkipCertVerify,
+		config.ExportNetworkEnvVars,
+		config.HealthyMonitoringInterval,
+		config.UnhealthyMonitoringInterval,
+		healthCheckWorkPool,
+		clock,
+		postSetupHook,
+		config.PostSetupUser,
+		config.Zone,
+		config.FirewallEnv,
+	)
+
+	hub := event.NewHub()
+
+	totalCapacity := fetchCapacity(logger, gardenClient, config)
+
+	containerConfig := containerstore.ContainerConfig{
+		OwnerName:              config.ContainerOwnerName,
+		INodeLimit:             config.ContainerInodeLimit,
+		MaxCPUShares:           config.ContainerMaxCpuShares,
+		ReservedExpirationTime: config.ReservedExpirationTime,
+		ReapInterval:           config.ContainerReapInterval,
+	}
+
+	containerStore := containerstore.New(
+		containerConfig,
+		&totalCapacity,
+		gardenClient,
+		containerstore.NewDependencyManager(cache),
+		vollocal.NewLocalClient(config.VolmanDriverPath),
+		clock,
+		hub,
+		transformer,
+		config.TrustedSystemCertificatesPath,
+		config.FirewallEnv,
+	)
 
 	workPoolSettings := executor.WorkPoolSettings{
 		CreateWorkPoolSize:  config.CreateWorkPoolSize,
@@ -174,59 +234,59 @@ func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (e
 		MetricsWorkPoolSize: config.MetricsWorkPoolSize,
 	}
 
-	depotClientProvider, err := depot.NewClientProvider(
-		fetchCapacity(logger, gardenClient, config),
-		allocationStore,
-		gardenStore,
+	depotClient := depot.NewClient(
+		totalCapacity,
+		containerStore,
+		gardenClient,
+		vollocal.NewLocalClient(config.VolmanDriverPath),
 		hub,
-		keyed_lock.NewLockManager(),
 		workPoolSettings,
 	)
-	if err != nil {
-		return nil, grouper.Members{}, err
+
+	healthcheckSpec := garden.ProcessSpec{
+		Path: config.GardenHealthcheckProcessPath,
+		Args: config.GardenHealthcheckProcessArgs,
+		User: config.GardenHealthcheckProcessUser,
+		Env:  config.GardenHealthcheckProcessEnv,
+		Dir:  config.GardenHealthcheckProcessDir,
 	}
 
-	metricsLogger := logger.Session("metrics-reporter")
-	containerMetricsLogger := logger.Session("container-metrics-reporter")
+	gardenHealthcheck := gardenhealth.NewChecker(
+		config.GardenHealthcheckRootFS,
+		config.HealthCheckContainerOwnerName,
+		config.GardenHealthcheckCommandRetryPause,
+		healthcheckSpec,
+		gardenClient,
+		guidgen.DefaultGenerator,
+	)
 
-	return depotClientProvider.WithLogger(logger),
+	return depotClient,
 		grouper.Members{
 			{"metrics-reporter", &metrics.Reporter{
-				ExecutorSource: depotClientProvider.WithLogger(metricsLogger),
+				ExecutorSource: depotClient,
 				Interval:       metricsReportInterval,
-				Logger:         metricsLogger,
+				Clock:          clock,
+				Logger:         logger,
 			}},
 			{"hub-closer", closeHub(hub)},
-			{"registry-pruner", allocationStore.RegistryPruner(logger, config.RegistryPruningInterval)},
 			{"container-metrics-reporter", containermetrics.NewStatsReporter(
-				containerMetricsLogger,
+				logger,
 				containerMetricsReportInterval,
 				clock,
-				depotClientProvider.WithLogger(containerMetricsLogger),
+				depotClient,
 			)},
+			{"garden_health_checker", gardenhealth.NewRunner(
+				config.GardenHealthcheckInterval,
+				config.GardenHealthcheckTimeout,
+				logger,
+				gardenHealthcheck,
+				depotClient,
+				clock,
+			)},
+			{"registry-pruner", containerStore.NewRegistryPruner(logger)},
+			{"container-reaper", containerStore.NewContainerReaper(logger)},
 		},
 		nil
-}
-
-func ValidateExecutor(logger lager.Logger, config Configuration) bool {
-	valid := true
-
-	if config.ContainerMaxCpuShares == 0 {
-		logger.Error("max-cpu-shares-invalid", nil)
-		valid = false
-	}
-
-	if config.HealthyMonitoringInterval <= 0 {
-		logger.Error("healthy-monitoring-interval-invalid", nil)
-		valid = false
-	}
-
-	if config.UnhealthyMonitoringInterval <= 0 {
-		logger.Error("unhealthy-monitoring-interval-invalid", nil)
-		valid = false
-	}
-
-	return valid
 }
 
 // Until we get a successful response from garden,
@@ -252,7 +312,10 @@ func waitForGarden(logger lager.Logger, gardenClient GardenClient.Client, clock 
 			case nil:
 				logger.Info("ping-garden-success", lager.Data{"wait-time-ns:": clock.Since(pingStart)})
 				// send 0 to indicate ping responded successfully
-				stalledDuration.Send(0)
+				sendError := stalledDuration.Send(0)
+				if sendError != nil {
+					logger.Error("failed-to-send-stalled-duration-metric", sendError)
+				}
 				return nil
 			case garden.UnrecoverableError:
 				logger.Error("failed-to-ping-garden-with-unrecoverable-error", err)
@@ -264,7 +327,11 @@ func waitForGarden(logger lager.Logger, gardenClient GardenClient.Client, clock 
 
 		case <-heartbeatTimer.C():
 			logger.Info("emitting-stalled-garden-heartbeat", lager.Data{"wait-time-ns:": clock.Since(pingStart)})
-			stalledDuration.Send(clock.Since(pingStart))
+			sendError := stalledDuration.Send(clock.Since(pingStart))
+			if sendError != nil {
+				logger.Error("failed-to-send-stalled-duration-heartbeat-metric", sendError)
+			}
+
 			heartbeatTimer.Reset(StalledMetricHeartbeatInterval)
 		}
 	}
@@ -329,15 +396,20 @@ func setupWorkDir(logger lager.Logger, tempDir string) string {
 
 func initializeTransformer(
 	logger lager.Logger,
-	cachePath, workDir string,
-	maxCacheSizeInBytes uint64,
+	cache cacheddownloader.CachedDownloader,
+	workDir string,
 	maxConcurrentDownloads, maxConcurrentUploads uint,
 	skipSSLVerification bool,
 	exportNetworkEnvVars bool,
+	healthyMonitoringInterval time.Duration,
+	unhealthyMonitoringInterval time.Duration,
+	healthCheckWorkPool *workpool.WorkPool,
 	clock clock.Clock,
+	postSetupHook []string,
+	postSetupUser string,
 	zone string,
-) *transformer.Transformer {
-	cache := cacheddownloader.New(cachePath, workDir, int64(maxCacheSizeInBytes), 10*time.Minute, int(math.MaxInt8), skipSSLVerification)
+	firewallConfig string,
+) transformer.Transformer {
 	uploader := uploader.New(10*time.Minute, skipSSLVerification, logger)
 	extractor := extractor.NewDetectable()
 	compressor := compressor.NewTgz()
@@ -351,8 +423,14 @@ func initializeTransformer(
 		make(chan struct{}, maxConcurrentUploads),
 		workDir,
 		exportNetworkEnvVars,
+		healthyMonitoringInterval,
+		unhealthyMonitoringInterval,
+		healthCheckWorkPool,
 		clock,
+		postSetupHook,
+		postSetupUser,
 		zone,
+		firewallConfig,
 	)
 }
 
@@ -363,4 +441,45 @@ func closeHub(hub event.Hub) ifrit.Runner {
 		hub.Close()
 		return nil
 	})
+}
+
+func (config *Configuration) Validate(logger lager.Logger) bool {
+	valid := true
+
+	if config.ContainerMaxCpuShares == 0 {
+		logger.Error("max-cpu-shares-invalid", nil)
+		valid = false
+	}
+
+	if config.HealthyMonitoringInterval <= 0 {
+		logger.Error("healthy-monitoring-interval-invalid", nil)
+		valid = false
+	}
+
+	if config.UnhealthyMonitoringInterval <= 0 {
+		logger.Error("unhealthy-monitoring-interval-invalid", nil)
+		valid = false
+	}
+
+	if config.GardenHealthcheckInterval <= 0 {
+		logger.Error("garden-healthcheck-interval-invalid", nil)
+		valid = false
+	}
+
+	if config.GardenHealthcheckProcessUser == "" {
+		logger.Error("garden-healthcheck-process-user-invalid", nil)
+		valid = false
+	}
+
+	if config.GardenHealthcheckProcessPath == "" {
+		logger.Error("garden-healthcheck-process-path-invalid", nil)
+		valid = false
+	}
+
+	if config.PostSetupHook != "" && config.PostSetupUser == "" {
+		logger.Error("post-setup-hook-requires-a-user", nil)
+		valid = false
+	}
+
+	return valid
 }

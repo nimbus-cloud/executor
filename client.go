@@ -9,25 +9,22 @@ import (
 //go:generate counterfeiter -o fakes/fake_client.go . Client
 
 type Client interface {
-	Ping() error
-	AllocateContainers(requests []AllocationRequest) ([]AllocationFailure, error)
-	GetContainer(guid string) (Container, error)
-	RunContainer(*RunRequest) error
-	StopContainer(guid string) error
-	DeleteContainer(guid string) error
-	ListContainers(Tags) ([]Container, error)
-	GetAllMetrics(Tags) (map[string]Metrics, error)
-	GetMetrics(guid string) (ContainerMetrics, error)
-	RemainingResources() (ExecutorResources, error)
-	RemainingResourcesFrom([]Container) (ExecutorResources, error)
-	TotalResources() (ExecutorResources, error)
-	GetFiles(guid string, path string) (io.ReadCloser, error)
-	SubscribeToEvents() (EventSource, error)
-	Cleanup()
-}
-
-type ClientProvider interface {
-	WithLogger(logger lager.Logger) Client
+	Ping(logger lager.Logger) error
+	AllocateContainers(logger lager.Logger, requests []AllocationRequest) ([]AllocationFailure, error)
+	GetContainer(logger lager.Logger, guid string) (Container, error)
+	RunContainer(lager.Logger, *RunRequest) error
+	StopContainer(logger lager.Logger, guid string) error
+	DeleteContainer(logger lager.Logger, guid string) error
+	ListContainers(lager.Logger) ([]Container, error)
+	GetBulkMetrics(lager.Logger) (map[string]Metrics, error)
+	RemainingResources(lager.Logger) (ExecutorResources, error)
+	TotalResources(lager.Logger) (ExecutorResources, error)
+	GetFiles(logger lager.Logger, guid string, path string) (io.ReadCloser, error)
+	VolumeDrivers(logger lager.Logger) ([]string, error)
+	SubscribeToEvents(lager.Logger) (EventSource, error)
+	Healthy(lager.Logger) bool
+	SetHealthy(lager.Logger, bool)
+	Cleanup(lager.Logger)
 }
 
 type WorkPoolSettings struct {

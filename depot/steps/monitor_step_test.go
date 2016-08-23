@@ -89,7 +89,7 @@ var _ = Describe("MonitorStep", func() {
 		clock.Increment(d - 1*time.Microsecond)
 		Consistently(fakeStep.PerformCallCount, 0.05).Should(Equal(previousCheckCount))
 
-		clock.Increment(d)
+		clock.WaitForWatcherAndIncrement(d)
 		Eventually(fakeStep.PerformCallCount).Should(Equal(previousCheckCount + 1))
 	}
 
@@ -189,6 +189,12 @@ var _ = Describe("MonitorStep", func() {
 			donePerforming.Wait()
 		})
 
+		It("emits a message to the applications log stream", func() {
+			Eventually(fakeStreamer.Stdout().(*gbytes.Buffer)).Should(
+				gbytes.Say("Starting health monitoring of container\n"),
+			)
+		})
+
 		Context("when the check succeeds", func() {
 			BeforeEach(func() {
 				checkResults <- nil
@@ -203,11 +209,16 @@ var _ = Describe("MonitorStep", func() {
 					Eventually(hasBecomeHealthy).Should(Receive())
 				})
 
+				It("emits a log message for the success", func() {
+					Eventually(fakeStreamer.Stdout().(*gbytes.Buffer)).Should(
+						gbytes.Say("Container became healthy\n"),
+					)
+				})
+
 				It("logs the step", func() {
-					Expect(logger.TestSink.LogMessages()).To(ConsistOf([]string{
+					Eventually(logger.TestSink.LogMessages).Should(ConsistOf([]string{
 						"test.monitor-step.transitioned-to-healthy",
 					}))
-
 				})
 
 				Context("and the healthy interval passes", func() {
@@ -243,7 +254,12 @@ var _ = Describe("MonitorStep", func() {
 								"test.monitor-step.transitioned-to-healthy",
 								"test.monitor-step.transitioned-to-unhealthy",
 							}))
+						})
 
+						It("emits a log message for the success", func() {
+							Eventually(fakeStreamer.Stdout().(*gbytes.Buffer)).Should(
+								gbytes.Say("Container became unhealthy\n"),
+							)
 						})
 
 						It("completes with failure", func() {
@@ -261,7 +277,7 @@ var _ = Describe("MonitorStep", func() {
 
 			Context("and the start timeout is exceeded", func() {
 				BeforeEach(func() {
-					startTimeout = 50 * time.Millisecond
+					startTimeout = 60 * time.Millisecond
 					unhealthyInterval = 30 * time.Millisecond
 				})
 
