@@ -265,6 +265,7 @@ func (t *transformer) StepsRunner(
 			container.Ports,
 			t.exportNetworkEnvVars,
 			t.clock,
+			t.zone,
 		)
 	}
 
