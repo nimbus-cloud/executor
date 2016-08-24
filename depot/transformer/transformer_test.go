@@ -19,6 +19,9 @@ import (
 	"github.com/tedsuo/ifrit"
 
 	gfakes "github.com/cloudfoundry-incubator/garden/fakes"
+	"bytes"
+	"io"
+	"io/ioutil"
 )
 
 var _ = Describe("Transformer", func() {
@@ -34,6 +37,9 @@ var _ = Describe("Transformer", func() {
 
 		BeforeEach(func() {
 			gardenContainer = &gfakes.FakeContainer{}
+			gardenContainer.StreamOutStub = func(spec garden.StreamOutSpec) (io.ReadCloser, error) {
+				return ioutil.NopCloser(bytes.NewReader([]byte(""))), nil
+			}
 
 			logger = lagertest.NewTestLogger("test-container-store")
 			logStreamer = log_streamer.New("test", "test", 1)
