@@ -5,12 +5,12 @@ import (
 	"io"
 	"net/url"
 
-	"github.com/cloudfoundry-incubator/bbs/models"
-	"github.com/cloudfoundry-incubator/cacheddownloader"
-	"github.com/cloudfoundry-incubator/executor/depot/log_streamer"
+	"code.cloudfoundry.org/bbs/models"
+	"code.cloudfoundry.org/bytefmt"
+	"code.cloudfoundry.org/cacheddownloader"
+	"code.cloudfoundry.org/executor/depot/log_streamer"
+	"code.cloudfoundry.org/lager"
 	"github.com/cloudfoundry-incubator/garden"
-	"github.com/pivotal-golang/bytefmt"
-	"github.com/pivotal-golang/lager"
 )
 
 type downloadStep struct {
@@ -86,6 +86,7 @@ func (step *downloadStep) perform() error {
 
 	err = step.streamIn(step.model.To, downloadedFile)
 	if err != nil {
+		step.emitError("Copying into the container failed: %v", err)
 		return NewEmittableError(err, "Copying into the container failed")
 	}
 
@@ -106,7 +107,15 @@ func (step *downloadStep) fetch() (io.ReadCloser, int64, error) {
 		return nil, 0, err
 	}
 
-	tarStream, downloadedSize, err := step.cachedDownloader.Fetch(url, step.model.CacheKey, step.Cancelled())
+	tarStream, downloadedSize, err := step.cachedDownloader.Fetch(
+		url,
+		step.model.CacheKey,
+		cacheddownloader.ChecksumInfoType{
+			Algorithm: step.model.GetChecksumAlgorithm(),
+			Value:     step.model.GetChecksumValue(),
+		},
+		step.Cancelled(),
+	)
 	if err != nil {
 		step.logger.Error("fetch-failed", err)
 		return nil, 0, err
@@ -136,4 +145,14 @@ func (step *downloadStep) emit(format string, a ...interface{}) {
 	if step.model.Artifact != "" {
 		fmt.Fprintf(step.streamer.Stdout(), format, a...)
 	}
+}
+
+func (step *downloadStep) emitError(format string, a ...interface{}) {
+	err_bytes := []byte(fmt.Sprintf(format, a...))
+	if len(err_bytes) > 1024 {
+		truncation_length := 1024 - len([]byte(" (error truncated)"))
+		err_bytes = append(err_bytes[:truncation_length], []byte(" (error truncated)")...)
+	}
+
+	fmt.Fprintf(step.streamer.Stderr(), string(err_bytes))
 }

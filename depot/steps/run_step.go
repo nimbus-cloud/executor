@@ -7,16 +7,16 @@ import (
 	"io/ioutil"
 	"time"
 
-	"github.com/cloudfoundry-incubator/bbs/models"
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/cloudfoundry-incubator/executor/depot/log_streamer"
+	"code.cloudfoundry.org/bbs/models"
+	"code.cloudfoundry.org/clock"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/executor/depot/log_streamer"
+	"code.cloudfoundry.org/lager"
 	"github.com/cloudfoundry-incubator/garden"
-	"github.com/pivotal-golang/clock"
-	"github.com/pivotal-golang/lager"
 )
 
-const TERMINATE_TIMEOUT = 10 * time.Second
-const EXIT_TIMEOUT = 1 * time.Minute
+const TerminateTimeout = 10 * time.Second
+const ExitTimeout = 1 * time.Second
 
 var ErrExitTimeout = errors.New("process did not exit")
 
@@ -82,10 +82,13 @@ func (step *runStep) Perform() error {
 	exitStatusChan := make(chan int, 1)
 	errChan := make(chan error, 1)
 
-	step.logger.Info("creating-process")
+	step.logger.Debug("creating-process")
+
 	var nofile *uint64
+	var nproc *uint64
 	if step.model.ResourceLimits != nil {
 		nofile = step.model.ResourceLimits.Nofile
+		nproc = step.model.ResourceLimits.Nproc
 	}
 
 	var processIO garden.ProcessIO
@@ -108,7 +111,10 @@ func (step *runStep) Perform() error {
 		Env:  envVars,
 		User: step.model.User,
 
-		Limits: garden.ResourceLimits{Nofile: nofile},
+		Limits: garden.ResourceLimits{
+			Nofile: nofile,
+			Nproc:  nproc,
+		},
 	}, processIO)
 	if err != nil {
 		step.logger.Error("failed-creating-process", err)
@@ -116,7 +122,7 @@ func (step *runStep) Perform() error {
 	}
 
 	logger := step.logger.WithData(lager.Data{"process": process.ID()})
-	logger.Info("successful-process-create")
+	logger.Debug("successful-process-create")
 
 	go func() {
 		exitStatus, err := process.Wait()
@@ -155,7 +161,7 @@ func (step *runStep) Perform() error {
 					logger.Error("failed-to-get-info", err)
 				} else {
 					for _, ev := range info.Events {
-						if ev == "out of memory" {
+						if ev == "out of memory" || ev == "Out of memory" {
 							return NewEmittableError(nil, "Exited with status %d (out of memory)", exitStatus)
 						}
 					}
@@ -180,7 +186,7 @@ func (step *runStep) Perform() error {
 			logger.Debug("signalling-terminate-success")
 			cancel = nil
 
-			killTimer := step.clock.NewTimer(TERMINATE_TIMEOUT)
+			killTimer := step.clock.NewTimer(TerminateTimeout)
 			defer killTimer.Stop()
 
 			killSwitch = killTimer.C()
@@ -195,14 +201,14 @@ func (step *runStep) Perform() error {
 			logger.Debug("signalling-kill-success")
 			killSwitch = nil
 
-			exitTimer := step.clock.NewTimer(EXIT_TIMEOUT)
+			exitTimer := step.clock.NewTimer(ExitTimeout)
 			defer exitTimer.Stop()
 
 			exitTimeout = exitTimer.C()
 
 		case <-exitTimeout:
 			logger.Error("process-did-not-exit", nil, lager.Data{
-				"timeout": EXIT_TIMEOUT,
+				"timeout": ExitTimeout,
 			})
 
 			return ErrExitTimeout

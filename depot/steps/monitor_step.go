@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cloudfoundry-incubator/executor/depot/log_streamer"
+	"code.cloudfoundry.org/clock"
+	"code.cloudfoundry.org/executor/depot/log_streamer"
+	"code.cloudfoundry.org/lager"
 	"github.com/cloudfoundry/gunk/workpool"
-	"github.com/pivotal-golang/clock"
-	"github.com/pivotal-golang/lager"
 )
 
 func invalidInterval(field string, interval time.Duration) error {

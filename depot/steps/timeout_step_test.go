@@ -4,9 +4,9 @@ import (
 	"errors"
 	"time"
 
-	"github.com/cloudfoundry-incubator/executor/depot/steps"
-	"github.com/cloudfoundry-incubator/executor/depot/steps/fakes"
-	"github.com/pivotal-golang/lager/lagertest"
+	"code.cloudfoundry.org/executor/depot/steps"
+	"code.cloudfoundry.org/executor/depot/steps/fakes"
+	"code.cloudfoundry.org/lager/lagertest"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"

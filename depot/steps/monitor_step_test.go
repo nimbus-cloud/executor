@@ -6,12 +6,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudfoundry-incubator/executor/depot/log_streamer/fake_log_streamer"
-	"github.com/cloudfoundry-incubator/executor/depot/steps"
-	"github.com/cloudfoundry-incubator/executor/depot/steps/fakes"
+	"code.cloudfoundry.org/clock/fakeclock"
+	"code.cloudfoundry.org/executor/depot/log_streamer/fake_log_streamer"
+	"code.cloudfoundry.org/executor/depot/steps"
+	"code.cloudfoundry.org/executor/depot/steps/fakes"
+	"code.cloudfoundry.org/lager/lagertest"
 	"github.com/cloudfoundry/gunk/workpool"
-	"github.com/pivotal-golang/clock/fakeclock"
-	"github.com/pivotal-golang/lager/lagertest"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"

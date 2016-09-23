@@ -4,10 +4,11 @@ import (
 	"errors"
 	"net/url"
 
-	"github.com/cloudfoundry-incubator/cacheddownloader/cacheddownloaderfakes"
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/cloudfoundry-incubator/executor/depot/containerstore"
-	"github.com/cloudfoundry-incubator/executor/depot/log_streamer/fake_log_streamer"
+	"code.cloudfoundry.org/cacheddownloader"
+	"code.cloudfoundry.org/cacheddownloader/cacheddownloaderfakes"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/executor/depot/containerstore"
+	"code.cloudfoundry.org/executor/depot/log_streamer/fake_log_streamer"
 	"github.com/cloudfoundry-incubator/garden"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -16,16 +17,18 @@ import (
 
 var _ = Describe("DependencyManager", func() {
 	var (
-		dependencyManager containerstore.DependencyManager
-		cache             *cacheddownloaderfakes.FakeCachedDownloader
-		dependencies      []executor.CachedDependency
-		logStreamer       *fake_log_streamer.FakeLogStreamer
+		dependencyManager   containerstore.DependencyManager
+		cache               *cacheddownloaderfakes.FakeCachedDownloader
+		dependencies        []executor.CachedDependency
+		logStreamer         *fake_log_streamer.FakeLogStreamer
+		downloadRateLimiter chan struct{}
 	)
 
 	BeforeEach(func() {
 		cache = &cacheddownloaderfakes.FakeCachedDownloader{}
 		logStreamer = fake_log_streamer.NewFakeLogStreamer()
-		dependencyManager = containerstore.NewDependencyManager(cache)
+		downloadRateLimiter = make(chan struct{}, 2)
+		dependencyManager = containerstore.NewDependencyManager(cache, downloadRateLimiter)
 		dependencies = []executor.CachedDependency{
 			{Name: "name-1", CacheKey: "cache-key-1", LogSource: "log-source-1", From: "https://user:pass@example.com:8080/download-1", To: "/var/data/buildpack-1"},
 			{CacheKey: "cache-key-2", LogSource: "log-source-2", From: "http://example.com:1515/download-2", To: "/var/data/buildpack-2"},
@@ -77,7 +80,7 @@ var _ = Describe("DependencyManager", func() {
 			Expect(bindMounts.CacheKeys).To(ConsistOf(expectedCacheKeys))
 		})
 
-		It("Downloads the directories", func() {
+		It("downloads the directories", func() {
 			Expect(cache.FetchAsDirectoryCallCount()).To(Equal(2))
 			// Again order here will not necessisarily be preserved!
 			expectedUrls := []url.URL{
@@ -91,10 +94,10 @@ var _ = Describe("DependencyManager", func() {
 
 			downloadURLs := make([]url.URL, 2)
 			cacheKeys := make([]string, 2)
-			downloadUrl, cacheKey, _ := cache.FetchAsDirectoryArgsForCall(0)
+			downloadUrl, cacheKey, _, _ := cache.FetchAsDirectoryArgsForCall(0)
 			downloadURLs[0] = *downloadUrl
 			cacheKeys[0] = cacheKey
-			downloadUrl, cacheKey, _ = cache.FetchAsDirectoryArgsForCall(1)
+			downloadUrl, cacheKey, _, _ = cache.FetchAsDirectoryArgsForCall(1)
 			downloadURLs[1] = *downloadUrl
 			cacheKeys[1] = cacheKey
 			Expect(downloadURLs).To(ConsistOf(expectedUrls))
@@ -125,7 +128,7 @@ var _ = Describe("DependencyManager", func() {
 			Eventually(func() []byte {
 				stdout := logStreamer.Stdout().(*gbytes.Buffer)
 				return stdout.Contents()
-			}).Should(And(ContainSubstring("Downloading name-1..."), ContainSubstring("Downloading name-1 failed")))
+			}).Should(And(ContainSubstring("Downloading name-1..."), ContainSubstring("Downloading name-1 failed\n")))
 		})
 
 		It("returns the error", func() {
@@ -140,6 +143,49 @@ var _ = Describe("DependencyManager", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(bindMounts.CacheKeys).To(HaveLen(0))
 			Expect(bindMounts.GardenBindMounts).To(HaveLen(0))
+		})
+	})
+
+	Context("rate limiting", func() {
+		var downloadBlocker chan struct{}
+
+		BeforeEach(func() {
+			downloadBlocker = make(chan struct{})
+			cache.FetchAsDirectoryStub = func(downloadUrl *url.URL, cacheKey string, checksum cacheddownloader.ChecksumInfoType, cancelChan <-chan struct{}) (string, int64, error) {
+				<-downloadBlocker
+				return cacheKey, 0, nil
+			}
+
+			dependencies = append(dependencies, executor.CachedDependency{
+				Name:      "name3",
+				CacheKey:  "cache-key3",
+				LogSource: "log-source3",
+				From:      "https://user:pass@example.com:8080/download-1",
+				To:        "/var/data/buildpack-1",
+			})
+		})
+
+		It("limits how many downloads can occur concurrently", func() {
+			done := make(chan struct{})
+
+			go func() {
+				_, err := dependencyManager.DownloadCachedDependencies(logger, dependencies, logStreamer)
+				Expect(err).NotTo(HaveOccurred())
+				close(done)
+			}()
+
+			Eventually(cache.FetchAsDirectoryCallCount).Should(Equal(2))
+			Consistently(cache.FetchAsDirectoryCallCount).Should(Equal(2))
+
+			Eventually(downloadBlocker).Should(BeSent(struct{}{}))
+
+			Eventually(cache.FetchAsDirectoryCallCount).Should(Equal(3))
+			Consistently(cache.FetchAsDirectoryCallCount).Should(Equal(3))
+
+			Eventually(downloadBlocker).Should(BeSent(struct{}{}))
+			Eventually(downloadBlocker).Should(BeSent(struct{}{}))
+
+			Eventually(done).Should(BeClosed())
 		})
 	})
 })

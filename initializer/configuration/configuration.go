@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/cloudfoundry-incubator/executor"
+	"code.cloudfoundry.org/executor"
 	"github.com/cloudfoundry-incubator/garden"
 	garden_client "github.com/cloudfoundry-incubator/garden/client"
 )
@@ -39,7 +39,7 @@ func ConfigureCapacity(
 	return executor.ExecutorResources{
 		MemoryMB:   memory,
 		DiskMB:     disk,
-		Containers: int(gardenCapacity.MaxContainers),
+		Containers: int(gardenCapacity.MaxContainers) - 1,
 	}, nil
 }
 

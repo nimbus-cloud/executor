@@ -8,14 +8,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/cloudfoundry-incubator/executor/depot/event"
-	"github.com/cloudfoundry-incubator/executor/depot/transformer"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/executor/depot/event"
+	"code.cloudfoundry.org/executor/depot/transformer"
+	"code.cloudfoundry.org/lager"
+	"code.cloudfoundry.org/runtimeschema/metric"
+	"code.cloudfoundry.org/volman"
 	"github.com/cloudfoundry-incubator/garden"
 	"github.com/cloudfoundry-incubator/garden/server"
-	"github.com/cloudfoundry-incubator/runtime-schema/metric"
-	"github.com/cloudfoundry-incubator/volman"
-	"github.com/pivotal-golang/lager"
 	"github.com/tedsuo/ifrit"
 )
 
@@ -77,12 +77,12 @@ func newStoreNode(
 func (n *storeNode) acquireOpLock(logger lager.Logger) {
 	startTime := time.Now()
 	n.opLock.Lock()
-	logger.Info("ops-lock-aquired", lager.Data{"lock-wait-time": time.Now().Sub(startTime).String()})
+	logger.Debug("ops-lock-aquired", lager.Data{"lock-wait-time": time.Now().Sub(startTime).String()})
 }
 
 func (n *storeNode) releaseOpLock(logger lager.Logger) {
 	n.opLock.Unlock()
-	logger.Info("ops-lock-released")
+	logger.Debug("ops-lock-released")
 }
 
 func (n *storeNode) Info() executor.Container {
@@ -192,6 +192,18 @@ func (n *storeNode) mountVolumes(logger lager.Logger, info executor.Container) (
 	return gardenMounts, nil
 }
 
+func (n *storeNode) gardenProperties(container *executor.Container) garden.Properties {
+	properties := garden.Properties{}
+	if container.Network != nil {
+		for key, value := range container.Network.Properties {
+			properties["network."+key] = value
+		}
+	}
+	properties[ContainerOwnerProperty] = n.config.OwnerName
+
+	return properties
+}
+
 func (n *storeNode) createGardenContainer(logger lager.Logger, info *executor.Container, mounts []garden.BindMount) (garden.Container, error) {
 	containerSpec := garden.ContainerSpec{
 		Handle:     info.Guid,
@@ -212,9 +224,7 @@ func (n *storeNode) createGardenContainer(logger lager.Logger, info *executor.Co
 				LimitInShares: uint64(float64(n.config.MaxCPUShares) * float64(info.CPUWeight) / 100.0),
 			},
 		},
-		Properties: garden.Properties{
-			ContainerOwnerProperty: n.config.OwnerName,
-		},
+		Properties: n.gardenProperties(info),
 	}
 
 	netOutRules, err := convertEgressToNetOut(logger, info.EgressRules)
@@ -250,6 +260,9 @@ func (n *storeNode) createGardenContainer(logger lager.Logger, info *executor.Co
 	if err != nil {
 		return nil, err
 	}
+
+	info.MemoryLimit = containerSpec.Limits.Memory.LimitInBytes
+	info.DiskLimit = containerSpec.Limits.Disk.ByteHard
 
 	return gardenContainer, nil
 }
@@ -332,10 +345,15 @@ func (n *storeNode) Destroy(logger lager.Logger) error {
 		<-n.process.Wait()
 	}
 
+	logStreamer := logStreamerFromLogConfig(n.info.LogConfig)
+
+	fmt.Fprintf(logStreamer.Stdout(), "Destroying container\n")
 	err = n.destroyContainer(logger)
 	if err != nil {
+		fmt.Fprintf(logStreamer.Stderr(), "Failed to destroy container\n")
 		return err
 	}
+	fmt.Fprintf(logStreamer.Stdout(), "Successfully destroyed container\n")
 
 	n.infoLock.Lock()
 	cacheKeys := n.bindMountCacheKeys

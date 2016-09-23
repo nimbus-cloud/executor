@@ -3,9 +3,9 @@ package containerstore
 import (
 	"os"
 
+	"code.cloudfoundry.org/clock"
+	"code.cloudfoundry.org/lager"
 	"github.com/cloudfoundry-incubator/garden"
-	"github.com/pivotal-golang/clock"
-	"github.com/pivotal-golang/lager"
 )
 
 type containerReaper struct {

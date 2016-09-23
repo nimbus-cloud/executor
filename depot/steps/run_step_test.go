@@ -5,21 +5,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pivotal-golang/lager/lagertest"
+	"code.cloudfoundry.org/lager/lagertest"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gbytes"
 
-	"github.com/cloudfoundry-incubator/bbs/models"
+	"code.cloudfoundry.org/bbs/models"
+	"code.cloudfoundry.org/clock/fakeclock"
 	"github.com/cloudfoundry-incubator/garden"
 	gfakes "github.com/cloudfoundry-incubator/garden/fakes"
-	"github.com/pivotal-golang/clock/fakeclock"
 
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/cloudfoundry-incubator/executor/depot/log_streamer/fake_log_streamer"
-	"github.com/cloudfoundry-incubator/executor/depot/steps"
-	"github.com/cloudfoundry-incubator/executor/fakes"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/executor/depot/log_streamer/fake_log_streamer"
+	"code.cloudfoundry.org/executor/depot/steps"
+	"code.cloudfoundry.org/executor/fakes"
 )
 
 var _ = Describe("RunAction", func() {
@@ -30,6 +30,7 @@ var _ = Describe("RunAction", func() {
 	var gardenClient *fakes.FakeGardenClient
 	var logger *lagertest.TestLogger
 	var fileDescriptorLimit uint64
+	var processesLimit uint64
 	var externalIP string
 	var portMappings []executor.PortMapping
 	var exportNetworkEnvVars bool
@@ -41,6 +42,7 @@ var _ = Describe("RunAction", func() {
 
 	BeforeEach(func() {
 		fileDescriptorLimit = 17
+		processesLimit = 1024
 
 		runAction = models.RunAction{
 			Path: "sudo",
@@ -52,6 +54,7 @@ var _ = Describe("RunAction", func() {
 			},
 			ResourceLimits: &models.ResourceLimits{
 				Nofile: &fileDescriptorLimit,
+				Nproc:  &processesLimit,
 			},
 			User: "notroot",
 		}
@@ -119,6 +122,7 @@ var _ = Describe("RunAction", func() {
 				Expect(spec.Args).To(Equal([]string{"reboot"}))
 				Expect(spec.Dir).To(Equal("/some-dir"))
 				Expect(*spec.Limits.Nofile).To(BeNumerically("==", fileDescriptorLimit))
+				Expect(*spec.Limits.Nproc).To(BeNumerically("==", processesLimit))
 				Expect(spec.Env).To(ContainElement("A=1"))
 				Expect(spec.Env).To(ContainElement("B=2"))
 				Expect(spec.User).To(Equal("notroot"))
@@ -333,15 +337,20 @@ var _ = Describe("RunAction", func() {
 			})
 		})
 
-		Context("when a file descriptor limit is not configured", func() {
+		Context("when resource limits are not configured", func() {
 			BeforeEach(func() {
 				runAction.ResourceLimits = nil
 				spawnedProcess.WaitReturns(0, nil)
 			})
 
-			It("does not enforce it on the process", func() {
+			It("does not enforce a file descriptor limit on the process", func() {
 				_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
 				Expect(spec.Limits.Nofile).To(BeNil())
+			})
+
+			It("does not enforce a process limit on the process", func() {
+				_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
+				Expect(spec.Limits.Nproc).To(BeNil())
 			})
 		})
 
@@ -389,6 +398,24 @@ var _ = Describe("RunAction", func() {
 					"test.run-step.failed-creating-process",
 				}))
 
+			})
+		})
+
+		// Garden-RunC capitalizes out the O in out of memory whereas Garden-linux does not
+		Context("regardless of status code, when an Out of memory event has occured", func() {
+			BeforeEach(func() {
+				gardenClient.Connection.InfoReturns(
+					garden.ContainerInfo{
+						Events: []string{"happy land", "Out of memory", "another event"},
+					},
+					nil,
+				)
+
+				spawnedProcess.WaitReturns(19, nil)
+			})
+
+			It("returns an emittable error", func() {
+				Expect(stepErr).To(MatchError(steps.NewEmittableError(nil, "Exited with status 19 (out of memory)")))
 			})
 		})
 
@@ -546,7 +573,7 @@ var _ = Describe("RunAction", func() {
 				It("sends a kill signal to the process", func() {
 					Eventually(spawnedProcess.SignalCallCount).Should(Equal(1))
 
-					fakeClock.WaitForWatcherAndIncrement(steps.TERMINATE_TIMEOUT + 1*time.Second)
+					fakeClock.WaitForWatcherAndIncrement(steps.TerminateTimeout + 1*time.Second)
 
 					Eventually(spawnedProcess.SignalCallCount).Should(Equal(2))
 					Expect(spawnedProcess.SignalArgsForCall(1)).To(Equal(garden.SignalKill))
@@ -560,23 +587,22 @@ var _ = Describe("RunAction", func() {
 					It("finishes performing with failure", func() {
 						Eventually(spawnedProcess.SignalCallCount).Should(Equal(1))
 
-						fakeClock.WaitForWatcherAndIncrement(steps.TERMINATE_TIMEOUT + 1*time.Second)
+						fakeClock.WaitForWatcherAndIncrement(steps.TerminateTimeout)
 
 						Eventually(spawnedProcess.SignalCallCount).Should(Equal(2))
 						Expect(spawnedProcess.SignalArgsForCall(1)).To(Equal(garden.SignalKill))
 
-						fakeClock.WaitForWatcherAndIncrement(steps.TERMINATE_TIMEOUT + 1*time.Second)
+						fakeClock.WaitForWatcherAndIncrement(steps.ExitTimeout / 2)
 
 						Consistently(performErr).ShouldNot(Receive())
 
-						fakeClock.WaitForWatcherAndIncrement(steps.EXIT_TIMEOUT + 1*time.Second)
+						fakeClock.WaitForWatcherAndIncrement(steps.ExitTimeout / 2)
 
 						Eventually(performErr).Should(Receive(Equal(steps.ErrExitTimeout)))
 
 						Expect(logger.TestSink.LogMessages()).To(ContainElement(
 							ContainSubstring("process-did-not-exit"),
 						))
-
 					})
 				})
 			})

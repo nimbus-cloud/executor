@@ -3,9 +3,9 @@ package configuration_test
 import (
 	"errors"
 
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/cloudfoundry-incubator/executor/fakes"
-	"github.com/cloudfoundry-incubator/executor/initializer/configuration"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/executor/fakes"
+	"code.cloudfoundry.org/executor/initializer/configuration"
 	"github.com/cloudfoundry-incubator/garden"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -154,7 +154,7 @@ var _ = Describe("configuration", func() {
 
 			Describe("Containers Limit", func() {
 				It("uses the garden server's max containers", func() {
-					Expect(capacity.Containers).To(Equal(5))
+					Expect(capacity.Containers).To(Equal(4))
 				})
 			})
 		})

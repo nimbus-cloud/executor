@@ -1,34 +1,36 @@
 package initializer
 
 import (
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/cloudfoundry-incubator/cacheddownloader"
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/cloudfoundry-incubator/executor/containermetrics"
-	"github.com/cloudfoundry-incubator/executor/depot"
-	"github.com/cloudfoundry-incubator/executor/depot/containerstore"
-	"github.com/cloudfoundry-incubator/executor/depot/event"
-	"github.com/cloudfoundry-incubator/executor/depot/metrics"
-	"github.com/cloudfoundry-incubator/executor/depot/transformer"
-	"github.com/cloudfoundry-incubator/executor/depot/uploader"
-	"github.com/cloudfoundry-incubator/executor/gardenhealth"
-	"github.com/cloudfoundry-incubator/executor/guidgen"
-	"github.com/cloudfoundry-incubator/executor/initializer/configuration"
+	"code.cloudfoundry.org/archiver/compressor"
+	"code.cloudfoundry.org/archiver/extractor"
+	"code.cloudfoundry.org/cacheddownloader"
+	"code.cloudfoundry.org/clock"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/executor/containermetrics"
+	"code.cloudfoundry.org/executor/depot"
+	"code.cloudfoundry.org/executor/depot/containerstore"
+	"code.cloudfoundry.org/executor/depot/event"
+	"code.cloudfoundry.org/executor/depot/metrics"
+	"code.cloudfoundry.org/executor/depot/transformer"
+	"code.cloudfoundry.org/executor/depot/uploader"
+	"code.cloudfoundry.org/executor/gardenhealth"
+	"code.cloudfoundry.org/executor/guidgen"
+	"code.cloudfoundry.org/executor/initializer/configuration"
+	"code.cloudfoundry.org/lager"
+	"code.cloudfoundry.org/runtimeschema/metric"
+	"code.cloudfoundry.org/volman/vollocal"
 	"github.com/cloudfoundry-incubator/garden"
 	GardenClient "github.com/cloudfoundry-incubator/garden/client"
 	GardenConnection "github.com/cloudfoundry-incubator/garden/client/connection"
-	"github.com/cloudfoundry-incubator/runtime-schema/metric"
-	"github.com/cloudfoundry-incubator/volman/vollocal"
 	"github.com/cloudfoundry/gunk/workpool"
+	"github.com/cloudfoundry/systemcerts"
 	"github.com/google/shlex"
-	"github.com/pivotal-golang/archiver/compressor"
-	"github.com/pivotal-golang/archiver/extractor"
-	"github.com/pivotal-golang/clock"
-	"github.com/pivotal-golang/lager"
 	"github.com/tedsuo/ifrit"
 	"github.com/tedsuo/ifrit/grouper"
 )
@@ -39,7 +41,6 @@ const (
 	stalledDuration                = metric.Duration("StalledGardenDuration")
 	maxConcurrentUploads           = 5
 	metricsReportInterval          = 1 * time.Minute
-	containerMetricsReportInterval = 30 * time.Second
 )
 
 type executorContainers struct {
@@ -64,9 +65,10 @@ type Configuration struct {
 	CachePath            string
 	MaxCacheSizeInBytes  uint64
 	SkipCertVerify       bool
+	CACertsForDownloads  []byte
 	ExportNetworkEnvVars bool
 
-	VolmanDriverPath string
+	VolmanDriverPaths []string
 
 	ContainerMaxCpuShares       uint64
 	ContainerInodeLimit         uint64
@@ -86,6 +88,7 @@ type Configuration struct {
 
 	GardenHealthcheckRootFS            string
 	GardenHealthcheckInterval          time.Duration
+	GardenHealthcheckEmissionInterval  time.Duration
 	GardenHealthcheckTimeout           time.Duration
 	GardenHealthcheckCommandRetryPause time.Duration
 
@@ -101,7 +104,8 @@ type Configuration struct {
 	PostSetupHook string
 	PostSetupUser string
 
-	TrustedSystemCertificatesPath string
+	TrustedSystemCertificatesPath  string
+	ContainerMetricsReportInterval time.Duration
 
 	Zone string			// nimbus2 {hemel|slough}
 	FirewallEnv string		// nimbus2 {test|dev|stage|prod}
@@ -141,10 +145,12 @@ var DefaultConfiguration = Configuration{
 	HealthCheckWorkPoolSize:            defaultHealthCheckWorkPoolSize,
 	MaxConcurrentDownloads:             defaultMaxConcurrentDownloads,
 	GardenHealthcheckInterval:          10 * time.Minute,
+	GardenHealthcheckEmissionInterval:  30 * time.Second,
 	GardenHealthcheckTimeout:           10 * time.Minute,
 	GardenHealthcheckCommandRetryPause: time.Second,
 	GardenHealthcheckProcessArgs:       []string{},
 	GardenHealthcheckProcessEnv:        []string{},
+	ContainerMetricsReportInterval:     15 * time.Second,
 }
 
 func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (executor.Client, grouper.Members, error) {
@@ -174,6 +180,17 @@ func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (e
 		return nil, grouper.Members{}, err
 	}
 
+	caCertPool := systemcerts.SystemRootsPool()
+	if caCertPool == nil {
+		caCertPool = systemcerts.NewCertPool()
+	}
+
+	if len(config.CACertsForDownloads) > 0 {
+		if ok := caCertPool.AppendCertsFromPEM(config.CACertsForDownloads); !ok {
+			return nil, grouper.Members{}, errors.New("unable to load CA certificate")
+		}
+	}
+
 	cache := cacheddownloader.New(
 		config.CachePath,
 		workDir,
@@ -181,14 +198,22 @@ func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (e
 		10*time.Minute,
 		int(math.MaxInt8),
 		config.SkipCertVerify,
+		caCertPool,
 		cacheddownloader.TarTransform,
 	)
+
+	err = cache.RecoverState()
+	if err != nil {
+		return nil, grouper.Members{}, err
+	}
+
+	downloadRateLimiter := make(chan struct{}, uint(config.MaxConcurrentDownloads))
 
 	transformer := initializeTransformer(
 		logger,
 		cache,
 		workDir,
-		uint(config.MaxConcurrentDownloads),
+		downloadRateLimiter,
 		maxConcurrentUploads,
 		config.SkipCertVerify,
 		config.ExportNetworkEnvVars,
@@ -214,12 +239,16 @@ func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (e
 		ReapInterval:           config.ContainerReapInterval,
 	}
 
+	driverConfig := vollocal.NewDriverConfig()
+	driverConfig.DriverPaths = config.VolmanDriverPaths
+	volmanClient, volmanDriverSyncer := vollocal.NewServer(logger, driverConfig)
+
 	containerStore := containerstore.New(
 		containerConfig,
 		&totalCapacity,
 		gardenClient,
-		containerstore.NewDependencyManager(cache),
-		vollocal.NewLocalClient(config.VolmanDriverPath),
+		containerstore.NewDependencyManager(cache, downloadRateLimiter),
+		volmanClient,
 		clock,
 		hub,
 		transformer,
@@ -237,7 +266,7 @@ func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (e
 		totalCapacity,
 		containerStore,
 		gardenClient,
-		vollocal.NewLocalClient(config.VolmanDriverPath),
+		volmanClient,
 		hub,
 		workPoolSettings,
 	)
@@ -261,6 +290,7 @@ func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (e
 
 	return depotClient,
 		grouper.Members{
+			{"volman-driver-syncer", volmanDriverSyncer},
 			{"metrics-reporter", &metrics.Reporter{
 				ExecutorSource: depotClient,
 				Interval:       metricsReportInterval,
@@ -270,12 +300,13 @@ func Initialize(logger lager.Logger, config Configuration, clock clock.Clock) (e
 			{"hub-closer", closeHub(hub)},
 			{"container-metrics-reporter", containermetrics.NewStatsReporter(
 				logger,
-				containerMetricsReportInterval,
+				config.ContainerMetricsReportInterval,
 				clock,
 				depotClient,
 			)},
 			{"garden_health_checker", gardenhealth.NewRunner(
 				config.GardenHealthcheckInterval,
+				config.GardenHealthcheckEmissionInterval,
 				config.GardenHealthcheckTimeout,
 				logger,
 				gardenHealthcheck,
@@ -397,7 +428,8 @@ func initializeTransformer(
 	logger lager.Logger,
 	cache cacheddownloader.CachedDownloader,
 	workDir string,
-	maxConcurrentDownloads, maxConcurrentUploads uint,
+	downloadRateLimiter chan struct{},
+	maxConcurrentUploads uint,
 	skipSSLVerification bool,
 	exportNetworkEnvVars bool,
 	healthyMonitoringInterval time.Duration,
@@ -418,7 +450,7 @@ func initializeTransformer(
 		uploader,
 		extractor,
 		compressor,
-		make(chan struct{}, maxConcurrentDownloads),
+		downloadRateLimiter,
 		make(chan struct{}, maxConcurrentUploads),
 		workDir,
 		exportNetworkEnvVars,

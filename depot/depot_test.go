@@ -5,17 +5,15 @@ import (
 	"io"
 	"time"
 
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/cloudfoundry-incubator/executor/depot"
-	"github.com/cloudfoundry-incubator/executor/depot/containerstore/containerstorefakes"
-	efakes "github.com/cloudfoundry-incubator/executor/depot/event/fakes"
-	fakes "github.com/cloudfoundry-incubator/executor/fakes"
-	"github.com/cloudfoundry-incubator/volman"
-	"github.com/cloudfoundry-incubator/volman/voldriver"
-	"github.com/cloudfoundry-incubator/volman/volmanfakes"
-	"github.com/pivotal-golang/clock/fakeclock"
-	"github.com/pivotal-golang/lager"
-	"github.com/pivotal-golang/lager/lagertest"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/executor/depot"
+	"code.cloudfoundry.org/executor/depot/containerstore/containerstorefakes"
+	efakes "code.cloudfoundry.org/executor/depot/event/fakes"
+	"code.cloudfoundry.org/executor/fakes"
+	"code.cloudfoundry.org/lager"
+	"code.cloudfoundry.org/lager/lagertest"
+	"code.cloudfoundry.org/volman"
+	"code.cloudfoundry.org/volman/volmanfakes"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -31,7 +29,6 @@ var _ = Describe("Depot", func() {
 	var (
 		depotClient      executor.Client
 		logger           lager.Logger
-		fakeClock        *fakeclock.FakeClock
 		eventHub         *efakes.FakeHub
 		gardenClient     *fakes.FakeGardenClient
 		volmanClient     *volmanfakes.FakeManager
@@ -43,7 +40,6 @@ var _ = Describe("Depot", func() {
 
 	BeforeEach(func() {
 		logger = lagertest.NewTestLogger("test")
-		fakeClock = fakeclock.NewFakeClock(time.Now())
 		eventHub = new(efakes.FakeHub)
 		gardenClient = new(fakes.FakeGardenClient)
 		volmanClient = new(volmanfakes.FakeManager)
@@ -181,15 +177,11 @@ var _ = Describe("Depot", func() {
 	Describe("RunContainer", func() {
 		var (
 			containerGuid string
-			allocRequests []executor.AllocationRequest
 			runRequest    *executor.RunRequest
 		)
 
 		BeforeEach(func() {
 			containerGuid = "container-guid"
-			allocRequests = []executor.AllocationRequest{
-				newAllocationRequest(containerGuid, 512, 512),
-			}
 			runRequest = newRunRequest(containerGuid)
 		})
 
@@ -566,16 +558,6 @@ var _ = Describe("Depot", func() {
 	})
 
 	Describe("DeleteContainer", func() {
-		var requests []executor.AllocationRequest
-
-		BeforeEach(func() {
-			requests = []executor.AllocationRequest{
-				newAllocationRequest("guid-1", defaultMemoryMB, defaultDiskMB),
-				newAllocationRequest("guid-2", defaultMemoryMB, defaultDiskMB),
-				newAllocationRequest("guid-3", defaultMemoryMB, defaultDiskMB),
-			}
-		})
-
 		It("removes the container from the container store", func() {
 			err := depotClient.DeleteContainer(logger, "guid-1")
 			Expect(err).NotTo(HaveOccurred())
@@ -684,10 +666,10 @@ var _ = Describe("Depot", func() {
 	Describe("VolumeDrivers", func() {
 		Context("when getting volume drivers succeeds", func() {
 			BeforeEach(func() {
-				volmanClient.ListDriversReturns(volman.ListDriversResponse{Drivers: []voldriver.InfoResponse{
-					{Name: "ayrton", Path: "/ayrton"},
-					{Name: "damon", Path: "/damon"},
-					{Name: "michael", Path: "/michael"},
+				volmanClient.ListDriversReturns(volman.ListDriversResponse{Drivers: []volman.InfoResponse{
+					{Name: "ayrton"},
+					{Name: "damon"},
+					{Name: "michael"},
 				}}, nil)
 				volumeDrivers = []string{"ayrton", "damon", "michael"}
 			})

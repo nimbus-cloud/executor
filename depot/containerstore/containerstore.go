@@ -5,13 +5,13 @@ import (
 	"io"
 	"time"
 
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/cloudfoundry-incubator/executor/depot/event"
-	"github.com/cloudfoundry-incubator/executor/depot/transformer"
+	"code.cloudfoundry.org/clock"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/executor/depot/event"
+	"code.cloudfoundry.org/executor/depot/transformer"
+	"code.cloudfoundry.org/lager"
+	"code.cloudfoundry.org/volman"
 	"github.com/cloudfoundry-incubator/garden"
-	"github.com/cloudfoundry-incubator/volman"
-	"github.com/pivotal-golang/clock"
-	"github.com/pivotal-golang/lager"
 	"github.com/tedsuo/ifrit"
 )
 
@@ -44,6 +44,9 @@ type ContainerStore interface {
 	// Cleanup
 	NewRegistryPruner(logger lager.Logger) ifrit.Runner
 	NewContainerReaper(logger lager.Logger) ifrit.Runner
+
+	// shutdown the dependency manager
+	Cleanup()
 }
 
 type ContainerConfig struct {
@@ -90,6 +93,10 @@ func New(
 		clock:             clock,
 		trustedSystemCertificatesPath: trustedSystemCertificatesPath,
 	}
+}
+
+func (cs *containerStore) Cleanup() {
+	cs.dependencyManager.Stop()
 }
 
 func (cs *containerStore) Reserve(logger lager.Logger, req *executor.AllocationRequest) (executor.Container, error) {
@@ -151,6 +158,7 @@ func (cs *containerStore) Create(logger lager.Logger, guid string) (executor.Con
 
 	err = node.Create(logger)
 	if err != nil {
+		logger.Error("failed-to-create-container", err)
 		return executor.Container{}, err
 	}
 
@@ -255,8 +263,14 @@ func (cs *containerStore) Metrics(logger lager.Logger) (map[string]executor.Cont
 
 	nodes := cs.containers.List()
 	containerGuids := make([]string, 0, len(nodes))
+	memoryLimitMap := make(map[string]uint64)
+	diskLimitMap := make(map[string]uint64)
+
 	for i := range nodes {
-		containerGuids = append(containerGuids, nodes[i].Info().Guid)
+		nodeInfo := nodes[i].Info()
+		containerGuids = append(containerGuids, nodeInfo.Guid)
+		memoryLimitMap[nodeInfo.Guid] = nodeInfo.MemoryLimit
+		diskLimitMap[nodeInfo.Guid] = nodeInfo.DiskLimit
 	}
 
 	logger.Debug("getting-metrics-in-garden")
@@ -275,6 +289,8 @@ func (cs *containerStore) Metrics(logger lager.Logger) (map[string]executor.Cont
 				containerMetrics[guid] = executor.ContainerMetrics{
 					MemoryUsageInBytes: gardenMetric.MemoryStat.TotalUsageTowardLimit,
 					DiskUsageInBytes:   gardenMetric.DiskStat.ExclusiveBytesUsed,
+					MemoryLimitInBytes: memoryLimitMap[guid],
+					DiskLimitInBytes:   diskLimitMap[guid],
 					TimeSpentInCPU:     time.Duration(gardenMetric.CPUStat.Usage),
 				}
 			}

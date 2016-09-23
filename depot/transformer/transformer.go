@@ -5,18 +5,18 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cloudfoundry-incubator/bbs/models"
-	"github.com/cloudfoundry-incubator/cacheddownloader"
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/cloudfoundry-incubator/executor/depot/log_streamer"
-	"github.com/cloudfoundry-incubator/executor/depot/steps"
-	"github.com/cloudfoundry-incubator/executor/depot/uploader"
+	"code.cloudfoundry.org/archiver/compressor"
+	"code.cloudfoundry.org/archiver/extractor"
+	"code.cloudfoundry.org/bbs/models"
+	"code.cloudfoundry.org/cacheddownloader"
+	"code.cloudfoundry.org/clock"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/executor/depot/log_streamer"
+	"code.cloudfoundry.org/executor/depot/steps"
+	"code.cloudfoundry.org/executor/depot/uploader"
+	"code.cloudfoundry.org/lager"
 	"github.com/cloudfoundry-incubator/garden"
 	"github.com/cloudfoundry/gunk/workpool"
-	"github.com/pivotal-golang/archiver/compressor"
-	"github.com/pivotal-golang/archiver/extractor"
-	"github.com/pivotal-golang/clock"
-	"github.com/pivotal-golang/lager"
 	"github.com/tedsuo/ifrit"
 )
 
@@ -161,7 +161,7 @@ func (t *transformer) StepFor(
 				ports,
 				logger,
 			),
-			time.Duration(actionModel.Timeout),
+			time.Duration(actionModel.TimeoutMs)*time.Millisecond,
 			logger,
 		)
 
@@ -302,7 +302,7 @@ func (t *transformer) StepsRunner(
 			logger.Session("monitor"),
 			t.clock,
 			logStreamer,
-			time.Duration(container.StartTimeout)*time.Second,
+			time.Duration(container.StartTimeoutMs)*time.Millisecond,
 			t.healthyMonitoringInterval,
 			t.unhealthyMonitoringInterval,
 			t.healthCheckWorkPool,

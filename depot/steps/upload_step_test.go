@@ -12,19 +12,19 @@ import (
 	"os/user"
 	"time"
 
-	"github.com/cloudfoundry-incubator/bbs/models"
+	"code.cloudfoundry.org/bbs/models"
 	"github.com/cloudfoundry-incubator/garden"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gbytes"
 
-	"github.com/cloudfoundry-incubator/executor/depot/log_streamer/fake_log_streamer"
-	"github.com/cloudfoundry-incubator/executor/depot/steps"
-	Uploader "github.com/cloudfoundry-incubator/executor/depot/uploader"
-	"github.com/cloudfoundry-incubator/executor/depot/uploader/fake_uploader"
-	"github.com/cloudfoundry-incubator/executor/fakes"
-	Compressor "github.com/pivotal-golang/archiver/compressor"
-	"github.com/pivotal-golang/lager/lagertest"
+	Compressor "code.cloudfoundry.org/archiver/compressor"
+	"code.cloudfoundry.org/executor/depot/log_streamer/fake_log_streamer"
+	"code.cloudfoundry.org/executor/depot/steps"
+	Uploader "code.cloudfoundry.org/executor/depot/uploader"
+	"code.cloudfoundry.org/executor/depot/uploader/fake_uploader"
+	"code.cloudfoundry.org/executor/fakes"
+	"code.cloudfoundry.org/lager/lagertest"
 )
 
 type fakeUploader struct {
@@ -51,8 +51,7 @@ func newFakeStreamer() *fake_log_streamer.FakeLogStreamer {
 
 var _ = Describe("UploadStep", func() {
 	var (
-		step   steps.Step
-		result chan error
+		step steps.Step
 
 		uploadAction    *models.UploadAction
 		uploader        Uploader.Uploader
@@ -61,15 +60,12 @@ var _ = Describe("UploadStep", func() {
 		logger          *lagertest.TestLogger
 		compressor      Compressor.Compressor
 		fakeStreamer    *fake_log_streamer.FakeLogStreamer
-		currentUser     *user.User
 		uploadTarget    *httptest.Server
 		uploadedPayload []byte
 	)
 
 	BeforeEach(func() {
 		var err error
-
-		result = make(chan error)
 
 		uploadTarget = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			var err error
@@ -98,7 +94,7 @@ var _ = Describe("UploadStep", func() {
 
 		fakeStreamer = newFakeStreamer()
 
-		currentUser, err = user.Current()
+		_, err = user.Current()
 		Expect(err).NotTo(HaveOccurred())
 	})
 

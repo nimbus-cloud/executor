@@ -4,13 +4,13 @@ import (
 	"io"
 	"sync"
 
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/cloudfoundry-incubator/executor/depot/containerstore"
-	"github.com/cloudfoundry-incubator/executor/depot/event"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/executor/depot/containerstore"
+	"code.cloudfoundry.org/executor/depot/event"
+	"code.cloudfoundry.org/lager"
+	"code.cloudfoundry.org/volman"
 	"github.com/cloudfoundry-incubator/garden"
-	"github.com/cloudfoundry-incubator/volman"
 	"github.com/cloudfoundry/gunk/workpool"
-	"github.com/pivotal-golang/lager"
 )
 
 const ContainerStoppedBeforeRunMessage = "Container stopped by user"
@@ -75,6 +75,7 @@ func (c *client) Cleanup(logger lager.Logger) {
 	c.deletionWorkPool.Stop()
 	c.readWorkPool.Stop()
 	c.metricsWorkPool.Stop()
+	c.containerStore.Cleanup()
 }
 
 func (c *client) AllocateContainers(logger lager.Logger, requests []executor.AllocationRequest) ([]executor.AllocationFailure, error) {

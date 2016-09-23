@@ -1,8 +1,8 @@
 package event
 
 import (
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/pivotal-golang/eventhub"
+	"code.cloudfoundry.org/eventhub"
+	"code.cloudfoundry.org/executor"
 )
 
 const SUBSCRIBER_BUFFER = 1024

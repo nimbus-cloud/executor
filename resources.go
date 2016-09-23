@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/cloudfoundry-incubator/bbs/models"
+	"code.cloudfoundry.org/bbs/models"
 )
 
 type State string
@@ -39,6 +39,8 @@ type Container struct {
 	AllocatedAt int64              `json:"allocated_at"`
 	ExternalIP  string             `json:"external_ip"`
 	RunResult   ContainerRunResult `json:"run_result"`
+	MemoryLimit uint64             `json:"memory_limit"`
+	DiskLimit   uint64             `json:"disk_limit"`
 }
 
 func NewContainerFromResource(guid string, resource *Resource, tags Tags) Container {
@@ -140,11 +142,13 @@ func NewResource(memoryMB, diskMB int, rootFSPath string) Resource {
 }
 
 type CachedDependency struct {
-	Name      string `json:"name"`
-	From      string `json:"from"`
-	To        string `json:"to"`
-	CacheKey  string `json:"cache_key"`
-	LogSource string `json:"log_source"`
+	Name              string `json:"name"`
+	From              string `json:"from"`
+	To                string `json:"to"`
+	CacheKey          string `json:"cache_key"`
+	LogSource         string `json:"log_source"`
+	ChecksumValue     string `json:"checksum_value"`
+	ChecksumAlgorithm string `json:"checksum_value"`
 }
 
 type RunInfo struct {
@@ -153,7 +157,7 @@ type RunInfo struct {
 	Ports                         []PortMapping               `json:"ports"`
 	LogConfig                     LogConfig                   `json:"log_config"`
 	MetricsConfig                 MetricsConfig               `json:"metrics_config"`
-	StartTimeout                  uint                        `json:"start_timeout"`
+	StartTimeoutMs                uint                        `json:"start_timeout_ms"`
 	Privileged                    bool                        `json:"privileged"`
 	CachedDependencies            []CachedDependency          `json:"cached_dependencies"`
 	Setup                         *models.Action              `json:"setup"`
@@ -163,6 +167,7 @@ type RunInfo struct {
 	Env                           []EnvironmentVariable       `json:"env,omitempty"`
 	TrustedSystemCertificatesPath string                      `json:"trusted_system_certificates_path,omitempty"`
 	VolumeMounts                  []VolumeMount               `json:"volume_mounts"`
+	Network                       *Network                    `json:"network,omitempty"`
 }
 
 type BindMountMode uint8
@@ -178,6 +183,10 @@ type VolumeMount struct {
 	Config        map[string]interface{} `json:"config"`
 	ContainerPath string                 `json:"container_path"`
 	Mode          BindMountMode          `json:"mode"`
+}
+
+type Network struct {
+	Properties map[string]string `json:"properties",omitempty"`
 }
 
 type InnerContainer Container
@@ -198,6 +207,8 @@ type EnvironmentVariable struct {
 type ContainerMetrics struct {
 	MemoryUsageInBytes uint64        `json:"memory_usage_in_bytes"`
 	DiskUsageInBytes   uint64        `json:"disk_usage_in_bytes"`
+	MemoryLimitInBytes uint64        `json:"memory_limit_in_bytes"`
+	DiskLimitInBytes   uint64        `json:"disk_limit_in_bytes"`
 	TimeSpentInCPU     time.Duration `json:"time_spent_in_cpu"`
 }
 

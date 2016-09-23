@@ -8,21 +8,23 @@ import (
 	"io/ioutil"
 	"net/url"
 	"os"
+	"strings"
 
-	cdfakes "github.com/cloudfoundry-incubator/cacheddownloader/cacheddownloaderfakes"
-	"github.com/pivotal-golang/lager/lagertest"
+	"code.cloudfoundry.org/cacheddownloader"
+	cdfakes "code.cloudfoundry.org/cacheddownloader/cacheddownloaderfakes"
+	"code.cloudfoundry.org/lager/lagertest"
 
-	"github.com/cloudfoundry-incubator/bbs/models"
+	"code.cloudfoundry.org/bbs/models"
 	"github.com/cloudfoundry-incubator/garden"
 
-	"github.com/cloudfoundry-incubator/executor/depot/log_streamer/fake_log_streamer"
-	"github.com/cloudfoundry-incubator/executor/depot/steps"
-	"github.com/cloudfoundry-incubator/executor/fakes"
+	"code.cloudfoundry.org/executor/depot/log_streamer/fake_log_streamer"
+	"code.cloudfoundry.org/executor/depot/steps"
+	"code.cloudfoundry.org/executor/fakes"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gbytes"
 
-	archiveHelper "github.com/pivotal-golang/archiver/extractor/test_helper"
+	archiveHelper "code.cloudfoundry.org/archiver/extractor/test_helper"
 )
 
 var _ = Describe("DownloadAction", func() {
@@ -84,10 +86,30 @@ var _ = Describe("DownloadAction", func() {
 		It("downloads via the cache with a tar transformer", func() {
 			Expect(cache.FetchCallCount()).To(Equal(1))
 
-			url, cacheKey, cancelChan := cache.FetchArgsForCall(0)
+			url, cacheKey, checksumInfo, cancelChan := cache.FetchArgsForCall(0)
 			Expect(url.Host).To(ContainSubstring("mr_jones"))
 			Expect(cacheKey).To(Equal("the-cache-key"))
+			Expect(checksumInfo.Algorithm).To(Equal(""))
+			Expect(checksumInfo.Value).To(Equal(""))
 			Expect(cancelChan).NotTo(BeNil())
+		})
+
+		Context("when checksum is provided", func() {
+			BeforeEach(func() {
+				downloadAction.ChecksumAlgorithm = "md5"
+				downloadAction.ChecksumValue = "checksum-value"
+			})
+
+			It("downloads via the cache with a tar tranformer and specified checksum", func() {
+				Expect(cache.FetchCallCount()).To(Equal(1))
+
+				url, cacheKey, checksumInfo, cancelChan := cache.FetchArgsForCall(0)
+				Expect(url.Host).To(ContainSubstring("mr_jones"))
+				Expect(cacheKey).To(Equal("the-cache-key"))
+				Expect(checksumInfo.Algorithm).To(Equal("md5"))
+				Expect(checksumInfo.Value).To(Equal("checksum-value"))
+				Expect(cancelChan).NotTo(BeNil())
+			})
 		})
 
 		It("logs the step", func() {
@@ -200,26 +222,54 @@ var _ = Describe("DownloadAction", func() {
 			})
 
 			Context("when there is an error copying the extracted files into the container", func() {
-				var expectedErr = errors.New("oh no!")
+				var expectedErr error
 
-				BeforeEach(func() {
-					gardenClient.Connection.StreamInReturns(expectedErr)
+				Context("when the error message is under 1kb", func() {
+					BeforeEach(func() {
+						expectedErr = errors.New("oh no!")
+						gardenClient.Connection.StreamInReturns(expectedErr)
+					})
+
+					It("returns an error", func() {
+						Expect(stepErr.Error()).To(ContainSubstring("Copying into the container failed"))
+					})
+
+					It("streams an error", func() {
+						stderr := fakeStreamer.Stderr().(*gbytes.Buffer)
+						Expect(stderr.Contents()).To(ContainSubstring("Copying into the container failed"))
+						Expect(stderr.Contents()).To(ContainSubstring("oh no!"))
+					})
+
+					It("logs the step", func() {
+						Expect(logger.TestSink.LogMessages()).To(ConsistOf([]string{
+							"test.download-step.acquiring-limiter",
+							"test.download-step.acquired-limiter",
+							"test.download-step.fetch-starting",
+							"test.download-step.fetch-complete",
+							"test.download-step.stream-in-starting",
+							"test.download-step.stream-in-failed",
+						}))
+
+					})
 				})
 
-				It("returns an error", func() {
-					Expect(stepErr.Error()).To(ContainSubstring("Copying into the container failed"))
-				})
+				Context("when the error message is over 1kb", func() {
+					BeforeEach(func() {
+						error_message := strings.Repeat("error", 1024)
+						expectedErr = errors.New(error_message)
 
-				It("logs the step", func() {
-					Expect(logger.TestSink.LogMessages()).To(ConsistOf([]string{
-						"test.download-step.acquiring-limiter",
-						"test.download-step.acquired-limiter",
-						"test.download-step.fetch-starting",
-						"test.download-step.fetch-complete",
-						"test.download-step.stream-in-starting",
-						"test.download-step.stream-in-failed",
-					}))
+						gardenClient.Connection.StreamInReturns(expectedErr)
 
+					})
+
+					It("truncates the error", func() {
+
+						stderr := fakeStreamer.Stderr().(*gbytes.Buffer)
+						println(stderr.Contents())
+						Expect(stderr.Contents()).To(ContainSubstring("Copying into the container failed"))
+						Expect(stderr.Contents()).To(ContainSubstring("(error truncated)"))
+						Expect([]byte(stderr.Contents())).Should(HaveLen(1024))
+					})
 				})
 			})
 		})
@@ -290,7 +340,7 @@ var _ = Describe("DownloadAction", func() {
 			BeforeEach(func() {
 				calledChan = make(chan struct{})
 
-				cache.FetchStub = func(u *url.URL, key string, cancelCh <-chan struct{}) (io.ReadCloser, int64, error) {
+				cache.FetchStub = func(u *url.URL, key string, checksumInfo cacheddownloader.ChecksumInfoType, cancelCh <-chan struct{}) (io.ReadCloser, int64, error) {
 					Expect(cancelCh).NotTo(BeNil())
 					Expect(cancelCh).NotTo(BeClosed())
 
@@ -411,7 +461,7 @@ var _ = Describe("DownloadAction", func() {
 			fetchCh := make(chan struct{}, 3)
 			barrier := make(chan struct{})
 			nopCloser := ioutil.NopCloser(new(bytes.Buffer))
-			cache.FetchStub = func(urlToFetch *url.URL, cacheKey string, cancelChan <-chan struct{}) (io.ReadCloser, int64, error) {
+			cache.FetchStub = func(urlToFetch *url.URL, cacheKey string, checksumInfo cacheddownloader.ChecksumInfoType, cancelChan <-chan struct{}) (io.ReadCloser, int64, error) {
 				fetchCh <- struct{}{}
 				<-barrier
 				return nopCloser, 42, nil

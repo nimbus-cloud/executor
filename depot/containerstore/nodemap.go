@@ -4,8 +4,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudfoundry-incubator/executor"
-	"github.com/pivotal-golang/lager"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/lager"
 )
 
 type nodeMap struct {

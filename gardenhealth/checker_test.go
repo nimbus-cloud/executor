@@ -3,12 +3,12 @@ package gardenhealth_test
 import (
 	"errors"
 
-	"github.com/cloudfoundry-incubator/executor/depot/containerstore"
-	"github.com/cloudfoundry-incubator/executor/gardenhealth"
-	"github.com/cloudfoundry-incubator/executor/guidgen/fakeguidgen"
+	"code.cloudfoundry.org/executor/depot/containerstore"
+	"code.cloudfoundry.org/executor/gardenhealth"
+	"code.cloudfoundry.org/executor/guidgen/fakeguidgen"
+	"code.cloudfoundry.org/lager/lagertest"
 	"github.com/cloudfoundry-incubator/garden"
 	gardenFakes "github.com/cloudfoundry-incubator/garden/fakes"
-	"github.com/pivotal-golang/lager/lagertest"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
