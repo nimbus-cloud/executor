@@ -5,7 +5,7 @@ import (
 
 	"code.cloudfoundry.org/executor/depot/log_streamer"
 	"github.com/cloudfoundry-incubator/garden"
-	"github.com/pivotal-golang/lager"
+	"code.cloudfoundry.org/lager"
 	"bytes"
 	"gopkg.in/yaml.v2"
 	"strings"
