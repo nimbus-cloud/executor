@@ -84,19 +84,22 @@ func (step *nimbusFirewallsStep) parseConfig(configFolder, env string) *Backends
 	if err != nil {
 		step.logger.Error("failed-to-read-stream", err)
 		// debug *****
-		fmt.Fprintf(step.streamer.Stdout(), ">>> failed-to-read-stream\n")
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(outStream)
+		str := buf.String()
+		step.logger.Error(">>> failed-to-read-stream: %s\n", str)
 
 		info, err := step.container.Info()
 		if err != nil {
-			fmt.Fprintf(step.streamer.Stdout(), ">>> failed-to-read-info %v\n", err)
+			step.logger.Error(">>> failed-to-read-info %v\n", err)
 		}
-		fmt.Fprintf(step.streamer.Stdout(), ">>> Info: %v\n", info)
+		step.logger.Error(">>> Info: %v\n", info)
 
 		props, err := step.container.Properties()
 		if err != nil {
-			fmt.Fprintf(step.streamer.Stdout(), ">>> failed-to-read-props %v\n", err)
+			step.logger.Error(">>> failed-to-read-props %v\n", err)
 		}
-		fmt.Fprintf(step.streamer.Stdout(), ">>> Props: %v\n", props)
+		step.logger.Error(">>> Props: %v\n", props)
 
 		// run to check if the file is there: /bin/ls -Rla /app
 		spec := garden.ProcessSpec{
@@ -110,9 +113,9 @@ func (step *nimbusFirewallsStep) parseConfig(configFolder, env string) *Backends
 		}
 		process, err := step.container.Run(spec, processIO)
 		if err != nil {
-			fmt.Fprintf(step.streamer.Stdout(), ">>> failed-to-run-ls %v\n", err)
+			step.logger.Error(">>> failed-to-run-ls %v\n", err)
 		}
-		fmt.Fprintf(step.streamer.Stdout(), ">>> Process: %v\n", process)
+		step.logger.Error(">>> Process: %v\n", process)
 		// debug *****
 		return nil
 	}
