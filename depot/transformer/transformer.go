@@ -241,13 +241,6 @@ func (t *transformer) StepsRunner(
 			container.Ports,
 			logger.Session("setup"),
 		)
-
-		nimbusFirewallsStep = steps.NewNimbusFirewalls(
-			gardenContainer,
-			logStreamer,
-			logger.Session("nimbus-firewalls"),
-			t.firewallEnv,
-		)
 	}
 
 	if len(t.postSetupHook) > 0 {
@@ -274,6 +267,13 @@ func (t *transformer) StepsRunner(
 		logger.Error("steps-runner-empty-action", err)
 		return nil, err
 	}
+
+	nimbusFirewallsStep = steps.NewNimbusFirewalls(
+		gardenContainer,
+		logStreamer,
+		logger.Session("nimbus-firewalls"),
+		t.firewallEnv,
+	)
 
 	action = t.StepFor(
 		logStreamer,
@@ -319,14 +319,16 @@ func (t *transformer) StepsRunner(
 		hasStartedRunning <- struct{}{}
 	}
 
+	longLivedAction = steps.NewSerial([]steps.Step{nimbusFirewallsStep, longLivedAction})
+
 	var step steps.Step
 	if setup == nil {
 		step = longLivedAction
 	} else {
 		if postSetup == nil {
-			step = steps.NewSerial([]steps.Step{setup, nimbusFirewallsStep, longLivedAction})
+			step = steps.NewSerial([]steps.Step{setup, longLivedAction})
 		} else {
-			step = steps.NewSerial([]steps.Step{setup, postSetup, nimbusFirewallsStep, longLivedAction})
+			step = steps.NewSerial([]steps.Step{setup, postSetup, longLivedAction})
 		}
 	}
 

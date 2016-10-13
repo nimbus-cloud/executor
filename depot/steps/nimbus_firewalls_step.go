@@ -71,10 +71,10 @@ type Backends struct {
 func (step *nimbusFirewallsStep) parseConfig(configFolder, env string) *Backends {
 
 	backendsFile := configFolder + "/backends-" + env + ".yml"
-	outStream, err := step.container.StreamOut(garden.StreamOutSpec{Path: backendsFile, User: "root"})
+	outStream, err := step.container.StreamOut(garden.StreamOutSpec{Path: backendsFile, User: "vcap"})
 
 	if err != nil {
-		step.logger.Error("stream-backends-file-failed", err)
+		step.logger.Error("stream-backends-file-failed", err, lager.Data{"backends_file": backendsFile})
 		return nil
 	}
 	defer outStream.Close()
@@ -82,42 +82,7 @@ func (step *nimbusFirewallsStep) parseConfig(configFolder, env string) *Backends
 	tarStream := tar.NewReader(outStream)
 	_, err = tarStream.Next()
 	if err != nil {
-		step.logger.Error("failed-to-read-stream", err, lager.Data{"backends_file": backendsFile})
-		// debug *****
-		buf := new(bytes.Buffer)
-		buf.ReadFrom(outStream)
-		str := buf.String()
-		step.logger.Info("failed-to-read-stream", lager.Data{"stream": str})
-
-		info, err := step.container.Info()
-		if err != nil {
-			step.logger.Error("failed-to-read-info", err)
-		}
-		step.logger.Info("Info: %v\n", lager.Data{"info": info})
-
-		props, err := step.container.Properties()
-		if err != nil {
-			step.logger.Error("failed-to-read-props", err)
-		}
-		step.logger.Info("Props:", lager.Data{"props": props})
-
-		// run to check if the file is there: /bin/ls -Rla /app
-		spec := garden.ProcessSpec{
-			Path: "/bin/ls",
-			Args: []string{"-Rla", "/app"},
-			User: "root",
-		}
-		writer := new(bytes.Buffer)
-		processIO := garden.ProcessIO{
-			Stdout: writer,
-			Stderr: writer,
-		}
-		process, err := step.container.Run(spec, processIO)
-		if err != nil {
-			step.logger.Error("failed-to-run-ls", err)
-		}
-		step.logger.Info("Process ls ", lager.Data{"process": process, "output": writer.String()})
-		// debug *****
+		step.logger.Error("failed-to-read-stream", err)
 		return nil
 	}
 
