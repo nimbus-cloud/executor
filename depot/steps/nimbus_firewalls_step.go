@@ -71,7 +71,7 @@ type Backends struct {
 func (step *nimbusFirewallsStep) parseConfig(configFolder, env string) *Backends {
 
 	backendsFile := configFolder + "/backends-" + env + ".yml"
-	outStream, err := step.container.StreamOut(garden.StreamOutSpec{Path: backendsFile, User: "vcap"})
+	outStream, err := step.container.StreamOut(garden.StreamOutSpec{Path: backendsFile, User: "root"})
 
 	if err != nil {
 		step.logger.Error("stream-backends-file-failed", err, lager.Data{"backends_file": backendsFile})
