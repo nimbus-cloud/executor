@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/bbs/models"
-	"github.com/cloudfoundry-incubator/garden"
+	"code.cloudfoundry.org/garden"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gbytes"
@@ -90,7 +90,7 @@ var _ = Describe("UploadStep", func() {
 		logger = lagertest.NewTestLogger("test")
 
 		compressor = Compressor.NewTgz()
-		uploader = Uploader.New(5*time.Second, false, logger)
+		uploader = Uploader.New(logger, 5*time.Second, nil)
 
 		fakeStreamer = newFakeStreamer()
 

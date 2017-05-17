@@ -3,13 +3,14 @@ package containerstore
 import (
 	"fmt"
 	"net/url"
+	"time"
 
 	"code.cloudfoundry.org/bytefmt"
 	"code.cloudfoundry.org/cacheddownloader"
 	"code.cloudfoundry.org/executor"
 	"code.cloudfoundry.org/executor/depot/log_streamer"
+	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/lager"
-	"github.com/cloudfoundry-incubator/garden"
 )
 
 //go:generate counterfeiter -o containerstorefakes/fake_bindmounter.go . DependencyManager
@@ -17,7 +18,7 @@ import (
 type DependencyManager interface {
 	DownloadCachedDependencies(logger lager.Logger, mounts []executor.CachedDependency, logStreamer log_streamer.LogStreamer) (BindMounts, error)
 	ReleaseCachedDependencies(logger lager.Logger, keys []BindMountCacheKey) error
-	Stop()
+	Stop(logger lager.Logger)
 }
 
 type dependencyManager struct {
@@ -29,8 +30,13 @@ func NewDependencyManager(cache cacheddownloader.CachedDownloader, downloadRateL
 	return &dependencyManager{cache, downloadRateLimiter}
 }
 
-func (bm *dependencyManager) Stop() {
-	bm.cache.SaveState()
+func (bm *dependencyManager) Stop(logger lager.Logger) {
+	logger.Debug("stopping")
+	defer logger.Debug("stopping-complete")
+	err := bm.cache.SaveState(logger.Session("downloader"))
+	if err != nil {
+		logger.Error("failed-saving-cache-state", err, lager.Data{"err": err})
+	}
 }
 
 func (bm *dependencyManager) DownloadCachedDependencies(logger lager.Logger, mounts []executor.CachedDependency, streamer log_streamer.LogStreamer) (BindMounts, error) {
@@ -49,7 +55,11 @@ func (bm *dependencyManager) DownloadCachedDependencies(logger lager.Logger, mou
 
 	for i := range mounts {
 		go func(mount *executor.CachedDependency) {
+			limiterStart := time.Now()
 			bm.downloadRateLimiter <- struct{}{}
+			limiterTime := time.Now().Sub(limiterStart)
+			logger.Info("cached-dependency-rate-limiter", lager.Data{"cache-key": mount.CacheKey, "duration-ns": limiterTime})
+
 			defer func() {
 				<-bm.downloadRateLimiter
 			}()
@@ -90,6 +100,7 @@ func (bm *dependencyManager) downloadCachedDependency(logger lager.Logger, mount
 
 	logger.Debug("fetching-cache-dependency", lager.Data{"download-url": downloadURL.String(), "cache-key": mount.CacheKey})
 	dirPath, downloadedSize, err := bm.cache.FetchAsDirectory(
+		logger.Session("downloader"),
 		downloadURL,
 		mount.CacheKey,
 		cacheddownloader.ChecksumInfoType{
@@ -103,6 +114,7 @@ func (bm *dependencyManager) downloadCachedDependency(logger lager.Logger, mount
 		emit(streamer, mount, "Downloading %s failed", mount.Name)
 		return nil, err
 	}
+	logger.Debug("fetched-cache-dependency", lager.Data{"download-url": downloadURL.String(), "cache-key": mount.CacheKey, "size": downloadedSize})
 
 	if downloadedSize != 0 {
 		emit(streamer, mount, "Downloaded %s (%s)", mount.Name, bytefmt.ByteSize(uint64(downloadedSize)))
@@ -116,7 +128,7 @@ func (bm *dependencyManager) ReleaseCachedDependencies(logger lager.Logger, keys
 	for i := range keys {
 		key := &keys[i]
 		logger.Debug("releasing-cache-key", lager.Data{"cache-key": key.CacheKey, "dir": key.Dir})
-		err := bm.cache.CloseDirectory(key.CacheKey, key.Dir)
+		err := bm.cache.CloseDirectory(logger, key.CacheKey, key.Dir)
 		if err != nil {
 			logger.Error("failed-releasing-cache-key", err, lager.Data{"cache-key": key.CacheKey, "dir": key.Dir})
 			return err

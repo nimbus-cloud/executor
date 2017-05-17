@@ -38,6 +38,7 @@ type Container struct {
 	State       State              `json:"state"`
 	AllocatedAt int64              `json:"allocated_at"`
 	ExternalIP  string             `json:"external_ip"`
+	InternalIP  string             `json:"internal_ip"`
 	RunResult   ContainerRunResult `json:"run_result"`
 	MemoryLimit uint64             `json:"memory_limit"`
 	DiskLimit   uint64             `json:"disk_limit"`
@@ -130,13 +131,15 @@ func NewReservedContainerFromAllocationRequest(req *AllocationRequest, allocated
 type Resource struct {
 	MemoryMB   int    `json:"memory_mb"`
 	DiskMB     int    `json:"disk_mb"`
+	MaxPids    int    `json:"max_pids"`
 	RootFSPath string `json:"rootfs"`
 }
 
-func NewResource(memoryMB, diskMB int, rootFSPath string) Resource {
+func NewResource(memoryMB, diskMB, maxPids int, rootFSPath string) Resource {
 	return Resource{
 		MemoryMB:   memoryMB,
 		DiskMB:     diskMB,
+		MaxPids:    maxPids,
 		RootFSPath: rootFSPath,
 	}
 }
@@ -149,6 +152,10 @@ type CachedDependency struct {
 	LogSource         string `json:"log_source"`
 	ChecksumValue     string `json:"checksum_value"`
 	ChecksumAlgorithm string `json:"checksum_value"`
+}
+
+type CertificateProperties struct {
+	OrganizationalUnit []string `json:"organizational_unit"`
 }
 
 type RunInfo struct {
@@ -168,6 +175,9 @@ type RunInfo struct {
 	TrustedSystemCertificatesPath string                      `json:"trusted_system_certificates_path,omitempty"`
 	VolumeMounts                  []VolumeMount               `json:"volume_mounts"`
 	Network                       *Network                    `json:"network,omitempty"`
+	CertificateProperties         CertificateProperties       `json:"certificate_properties"`
+	ImageUsername                 string                      `json:"image_username"`
+	ImagePassword                 string                      `json:"image_password"`
 }
 
 type BindMountMode uint8

@@ -9,9 +9,10 @@ import (
 	"code.cloudfoundry.org/executor"
 	"code.cloudfoundry.org/executor/depot/event"
 	"code.cloudfoundry.org/executor/depot/transformer"
+	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/lager"
 	"code.cloudfoundry.org/volman"
-	"github.com/cloudfoundry-incubator/garden"
+	"code.cloudfoundry.org/go-loggregator/loggregator_v2"
 	"github.com/tedsuo/ifrit"
 )
 
@@ -46,7 +47,7 @@ type ContainerStore interface {
 	NewContainerReaper(logger lager.Logger) ifrit.Runner
 
 	// shutdown the dependency manager
-	Cleanup()
+	Cleanup(logger lager.Logger)
 }
 
 type ContainerConfig struct {
@@ -63,10 +64,12 @@ type containerStore struct {
 	gardenClient      garden.Client
 	dependencyManager DependencyManager
 	volumeManager     volman.Manager
+	credManager       CredManager
 	transformer       transformer.Transformer
 	containers        *nodeMap
 	eventEmitter      event.Hub
 	clock             clock.Clock
+	metronClient      loggregator_v2.Client
 
 	trustedSystemCertificatesPath string
 }
@@ -77,26 +80,30 @@ func New(
 	gardenClient garden.Client,
 	dependencyManager DependencyManager,
 	volumeManager volman.Manager,
+	credManager CredManager,
 	clock clock.Clock,
 	eventEmitter event.Hub,
 	transformer transformer.Transformer,
 	trustedSystemCertificatesPath string,
+	metronClient loggregator_v2.Client,
 ) ContainerStore {
 	return &containerStore{
-		containerConfig:   containerConfig,
-		gardenClient:      gardenClient,
-		dependencyManager: dependencyManager,
-		volumeManager:     volumeManager,
-		containers:        newNodeMap(totalCapacity),
-		eventEmitter:      eventEmitter,
-		transformer:       transformer,
-		clock:             clock,
+		containerConfig:               containerConfig,
+		gardenClient:                  gardenClient,
+		dependencyManager:             dependencyManager,
+		volumeManager:                 volumeManager,
+		credManager:                   credManager,
+		containers:                    newNodeMap(totalCapacity),
+		eventEmitter:                  eventEmitter,
+		transformer:                   transformer,
+		clock:                         clock,
+		metronClient:                  metronClient,
 		trustedSystemCertificatesPath: trustedSystemCertificatesPath,
 	}
 }
 
-func (cs *containerStore) Cleanup() {
-	cs.dependencyManager.Stop()
+func (cs *containerStore) Cleanup(logger lager.Logger) {
+	cs.dependencyManager.Stop(logger)
 }
 
 func (cs *containerStore) Reserve(logger lager.Logger, req *executor.AllocationRequest) (executor.Container, error) {
@@ -112,9 +119,11 @@ func (cs *containerStore) Reserve(logger lager.Logger, req *executor.AllocationR
 			cs.gardenClient,
 			cs.dependencyManager,
 			cs.volumeManager,
+			cs.credManager,
 			cs.eventEmitter,
 			cs.transformer,
 			cs.trustedSystemCertificatesPath,
+			cs.metronClient,
 		))
 
 	if err != nil {

@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"code.cloudfoundry.org/executor/depot/log_streamer"
-	"github.com/cloudfoundry-incubator/garden"
+	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/lager"
 	"bytes"
 	"gopkg.in/yaml.v2"
@@ -120,7 +120,7 @@ func (step *nimbusFirewallsStep) processBackends(backends *Backends) {
 			if err != nil {
 				fmt.Fprintf(step.streamer.Stderr(), "Error applying nb-config rule, err: %v, rule: %v \n", err, netOutRule)
 			} else {
-				fmt.Fprintf(step.streamer.Stdout(), "Sucessfully applied nb-config rule: %s:%d \n", destination.Ip, port)
+				fmt.Fprintf(step.streamer.Stdout(), "Successfully applied nb-config rule: %s:%d \n", destination.Ip, port)
 			}
 		}
 	}

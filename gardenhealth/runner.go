@@ -6,11 +6,11 @@ import (
 
 	"code.cloudfoundry.org/clock"
 	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/go-loggregator/loggregator_v2"
 	"code.cloudfoundry.org/lager"
-	"code.cloudfoundry.org/runtimeschema/metric"
 )
 
-const unhealthyCell = metric.Metric("UnhealthyCell")
+const UnhealthyCell = "UnhealthyCell"
 
 type HealthcheckTimeoutError struct{}
 
@@ -31,6 +31,7 @@ type Runner struct {
 	logger           lager.Logger
 	checker          Checker
 	executorClient   executor.Client
+	metronClient     loggregator_v2.Client
 	clock            clock.Clock
 }
 
@@ -46,6 +47,7 @@ func NewRunner(
 	logger lager.Logger,
 	checker Checker,
 	executorClient executor.Client,
+	metronClient loggregator_v2.Client,
 	clock clock.Clock,
 ) *Runner {
 	return &Runner{
@@ -55,6 +57,7 @@ func NewRunner(
 		logger:           logger.Session("garden-healthcheck"),
 		checker:          checker,
 		executorClient:   executorClient,
+		metronClient:     metronClient,
 		clock:            clock,
 		healthy:          false,
 		failures:         0,
@@ -82,20 +85,18 @@ func (r *Runner) Run(signals <-chan os.Signal, ready chan<- struct{}) error {
 		return nil
 
 	case <-healthcheckTimeout.C():
-		logger.Error("failed-initial-healthcheck-timeout", nil)
 		r.setUnhealthy(logger)
+		r.checker.Cancel(logger)
 		return HealthcheckTimeoutError{}
 
 	case err := <-healthcheckComplete:
 		if err != nil {
-			logger.Error("failed-initial-healthcheck", err)
 			r.setUnhealthy(logger)
 			return err
 		}
 		healthcheckTimeout.Stop()
 	}
 
-	logger.Info("passed-initial-healthcheck")
 	r.setHealthy(logger)
 
 	close(ready)
@@ -112,34 +113,29 @@ func (r *Runner) Run(signals <-chan os.Signal, ready chan<- struct{}) error {
 			return nil
 
 		case <-startHealthcheck.C():
-			logger.Info("check-starting")
 			healthcheckTimeout.Reset(r.timeoutInterval)
 			go r.healthcheckCycle(logger, healthcheckComplete)
 
 		case <-healthcheckTimeout.C():
-			logger.Error("failed-healthcheck-timeout", nil)
 			r.setUnhealthy(logger)
+			r.checker.Cancel(logger)
 
 		case <-emitInterval.C():
 			r.emitUnhealthyCellMetric(logger)
 
 		case err := <-healthcheckComplete:
-
 			timeoutOk := healthcheckTimeout.Stop()
 			switch err.(type) {
 			case nil:
-				logger.Info("passed-health-check")
 				if timeoutOk {
 					r.setHealthy(logger)
 				}
 
 			default:
-				logger.Error("failed-health-check", err)
 				r.setUnhealthy(logger)
 			}
 
 			startHealthcheck.Reset(r.checkInterval)
-			logger.Info("check-complete")
 		}
 	}
 }
@@ -159,9 +155,9 @@ func (r *Runner) setUnhealthy(logger lager.Logger) {
 func (r *Runner) emitUnhealthyCellMetric(logger lager.Logger) {
 	var err error
 	if r.executorClient.Healthy(logger) {
-		err = unhealthyCell.Send(0)
+		err = r.metronClient.SendMetric(UnhealthyCell, 0)
 	} else {
-		err = unhealthyCell.Send(1)
+		err = r.metronClient.SendMetric(UnhealthyCell, 1)
 	}
 
 	if err != nil {

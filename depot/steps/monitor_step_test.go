@@ -11,7 +11,7 @@ import (
 	"code.cloudfoundry.org/executor/depot/steps"
 	"code.cloudfoundry.org/executor/depot/steps/fakes"
 	"code.cloudfoundry.org/lager/lagertest"
-	"github.com/cloudfoundry/gunk/workpool"
+	"code.cloudfoundry.org/workpool"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -250,7 +250,7 @@ var _ = Describe("MonitorStep", func() {
 						})
 
 						It("logs the step", func() {
-							Expect(logger.TestSink.LogMessages()).To(ConsistOf([]string{
+							Eventually(func() []string { return logger.TestSink.LogMessages() }).Should(ConsistOf([]string{
 								"test.monitor-step.transitioned-to-healthy",
 								"test.monitor-step.transitioned-to-unhealthy",
 							}))

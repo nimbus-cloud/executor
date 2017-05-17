@@ -1,44 +1,100 @@
 package initializer_test
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/asn1"
+	"encoding/pem"
+	"io/ioutil"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"code.cloudfoundry.org/clock/fakeclock"
+	"code.cloudfoundry.org/durationjson"
+	"code.cloudfoundry.org/executor"
+	"code.cloudfoundry.org/executor/depot/containerstore"
 	"code.cloudfoundry.org/executor/initializer"
+	"code.cloudfoundry.org/executor/initializer/configuration"
+	"code.cloudfoundry.org/executor/initializer/fakes"
+	"code.cloudfoundry.org/garden"
+	mfakes "code.cloudfoundry.org/go-loggregator/loggregator_v2/fakes"
+	"code.cloudfoundry.org/lager"
 	"code.cloudfoundry.org/lager/lagertest"
-	"github.com/cloudfoundry-incubator/garden"
-	fake_metric "github.com/cloudfoundry/dropsonde/metric_sender/fake"
-	"github.com/cloudfoundry/dropsonde/metrics"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/ghttp"
 )
 
 var _ = Describe("Initializer", func() {
-	var initialTime time.Time
-	var sender *fake_metric.FakeMetricSender
-	var fakeGarden *ghttp.Server
-	var fakeClock *fakeclock.FakeClock
-	var errCh chan error
-	var done chan struct{}
-	var config initializer.Configuration
+	const StalledGardenDuration = "StalledGardenDuration"
+
+	var (
+		initialTime      time.Time
+		fakeGarden       *ghttp.Server
+		fakeClock        *fakeclock.FakeClock
+		errCh            chan error
+		done             chan struct{}
+		config           initializer.ExecutorConfig
+		logger           lager.Logger
+		fakeMetronClient *mfakes.FakeClient
+		metricMap        map[string]time.Duration
+		m                sync.RWMutex
+	)
 
 	BeforeEach(func() {
 		initialTime = time.Now()
-		sender = fake_metric.NewFakeMetricSender()
-		metrics.Initialize(sender, nil)
 		fakeGarden = ghttp.NewUnstartedServer()
 		fakeClock = fakeclock.NewFakeClock(initialTime)
 		errCh = make(chan error, 1)
 		done = make(chan struct{})
+		logger = lagertest.NewTestLogger("test")
 
 		fakeGarden.RouteToHandler("GET", "/ping", ghttp.RespondWithJSONEncoded(http.StatusOK, struct{}{}))
 		fakeGarden.RouteToHandler("GET", "/containers", ghttp.RespondWithJSONEncoded(http.StatusOK, struct{}{}))
 		fakeGarden.RouteToHandler("GET", "/capacity", ghttp.RespondWithJSONEncoded(http.StatusOK,
-			garden.Capacity{MemoryInBytes: 1024 * 1024 * 1024, DiskInBytes: 2048 * 1024 * 1024, MaxContainers: 4}))
+			garden.Capacity{MemoryInBytes: 1024 * 1024 * 1024, DiskInBytes: 20 * 1048 * 1024 * 1024, MaxContainers: 4}))
 		fakeGarden.RouteToHandler("GET", "/containers/bulk_info", ghttp.RespondWithJSONEncoded(http.StatusOK, struct{}{}))
-		config = initializer.DefaultConfiguration
+		config = initializer.ExecutorConfig{
+			AutoDiskOverheadMB:                 1,
+			CachePath:                          "/tmp/cache",
+			ContainerInodeLimit:                200000,
+			ContainerMaxCpuShares:              0,
+			ContainerMetricsReportInterval:     durationjson.Duration(15 * time.Second),
+			ContainerOwnerName:                 "executor",
+			ContainerReapInterval:              durationjson.Duration(time.Minute),
+			CreateWorkPoolSize:                 32,
+			DeleteWorkPoolSize:                 32,
+			DiskMB:                             configuration.Automatic,
+			ExportNetworkEnvVars:               false,
+			GardenAddr:                         "/tmp/garden.sock",
+			GardenHealthcheckCommandRetryPause: durationjson.Duration(1 * time.Second),
+			GardenHealthcheckEmissionInterval:  durationjson.Duration(30 * time.Second),
+			GardenHealthcheckInterval:          durationjson.Duration(10 * time.Minute),
+			GardenHealthcheckProcessArgs:       []string{},
+			GardenHealthcheckProcessEnv:        []string{},
+			GardenHealthcheckTimeout:           durationjson.Duration(10 * time.Minute),
+			GardenNetwork:                      "unix",
+			HealthCheckContainerOwnerName:      "executor-health-check",
+			HealthCheckWorkPoolSize:            64,
+			HealthyMonitoringInterval:          durationjson.Duration(30 * time.Second),
+			MaxCacheSizeInBytes:                10 * 1024 * 1024 * 1024,
+			MaxConcurrentDownloads:             5,
+			MemoryMB:                           configuration.Automatic,
+			MetricsWorkPoolSize:                8,
+			ReadWorkPoolSize:                   64,
+			ReservedExpirationTime:             durationjson.Duration(time.Minute),
+			SkipCertVerify:                     false,
+			TempDir:                            "/tmp",
+			UnhealthyMonitoringInterval:        durationjson.Duration(500 * time.Millisecond),
+			VolmanDriverPaths:                  "/tmpvolman1:/tmp/volman2",
+		}
+
+		fakeMetronClient = new(mfakes.FakeClient)
+
+		m = sync.RWMutex{}
 	})
 
 	AfterEach(func() {
@@ -46,20 +102,35 @@ var _ = Describe("Initializer", func() {
 		fakeGarden.Close()
 	})
 
+	getMetrics := func() map[string]time.Duration {
+		m.Lock()
+		defer m.Unlock()
+		m := make(map[string]time.Duration, len(metricMap))
+		for k, v := range metricMap {
+			m[k] = v
+		}
+		return m
+	}
+
 	JustBeforeEach(func() {
-		fakeGarden.Start()
 		config.GardenAddr = fakeGarden.HTTPTestServer.Listener.Addr().String()
 		config.GardenNetwork = "tcp"
 		go func() {
-			_, _, err := initializer.Initialize(lagertest.NewTestLogger("test"), config, fakeClock)
+			_, _, err := initializer.Initialize(logger, config, "fake-rootfs", fakeMetronClient, fakeClock)
 			errCh <- err
 			close(done)
 		}()
-	})
 
-	checkStalledMetric := func() float64 {
-		return sender.GetValue("StalledGardenDuration").Value
-	}
+		metricMap = make(map[string]time.Duration)
+		fakeMetronClient.SendDurationStub = func(name string, time time.Duration) error {
+			m.Lock()
+			metricMap[name] = time
+			m.Unlock()
+			return nil
+		}
+
+		fakeGarden.Start()
+	})
 
 	Context("when garden doesn't respond", func() {
 		var waitChan chan struct{}
@@ -77,16 +148,22 @@ var _ = Describe("Initializer", func() {
 		})
 
 		It("emits metrics when garden doesn't respond", func() {
-			Consistently(checkStalledMetric, 10*time.Millisecond).Should(BeEquivalentTo(0))
+			Consistently(getMetrics, 10*time.Millisecond).ShouldNot(HaveKey(StalledGardenDuration))
+
 			fakeClock.WaitForWatcherAndIncrement(initializer.StalledMetricHeartbeatInterval)
-			Eventually(checkStalledMetric).Should(BeNumerically("~", fakeClock.Since(initialTime)))
+			Eventually(fakeMetronClient.SendDurationCallCount).Should(Equal(1))
+
+			Eventually(getMetrics).Should(HaveKeyWithValue(StalledGardenDuration, fakeClock.Since(initialTime)))
 		})
 	})
 
 	Context("when garden responds", func() {
 		It("emits 0", func() {
-			Eventually(func() bool { return sender.HasValue("StalledGardenDuration") }).Should(BeTrue())
-			Expect(checkStalledMetric()).To(BeEquivalentTo(0))
+			Eventually(fakeMetronClient.SendDurationCallCount).Should(Equal(1))
+
+			Eventually(getMetrics).Should(HaveKeyWithValue(StalledGardenDuration, BeEquivalentTo(0)))
+
+			Consistently(errCh).ShouldNot(Receive(HaveOccurred()))
 		})
 	})
 
@@ -114,10 +191,12 @@ var _ = Describe("Initializer", func() {
 		})
 
 		It("emits zero once it succeeds", func() {
-			Consistently(func() bool { return sender.HasValue("StalledGardenDuration") }).Should(BeFalse())
+			Consistently(getMetrics).ShouldNot(HaveKey(StalledGardenDuration))
+
 			fakeClock.Increment(initializer.PingGardenInterval)
-			Eventually(func() bool { return sender.HasValue("StalledGardenDuration") }).Should(BeTrue())
-			Expect(checkStalledMetric()).To(BeEquivalentTo(0))
+			Eventually(fakeMetronClient.SendDurationCallCount).Should(Equal(1))
+
+			Eventually(getMetrics).Should(HaveKeyWithValue(StalledGardenDuration, BeEquivalentTo(0)))
 		})
 
 		Context("when the error is unrecoverable", func() {
@@ -130,7 +209,7 @@ var _ = Describe("Initializer", func() {
 			})
 
 			It("returns an error", func() {
-				Eventually(errCh).Should(Receive(HaveOccurred()))
+				Eventually(errCh).Should(Receive(BeAssignableToTypeOf(garden.UnrecoverableError{})))
 			})
 		})
 	})
@@ -141,52 +220,91 @@ var _ = Describe("Initializer", func() {
 		})
 
 		It("fails fast", func() {
-			Eventually(errCh).Should(Receive(HaveOccurred()))
+			Eventually(errCh).Should(Receive(MatchError("EOF found after escape character")))
+		})
+	})
+
+	Describe("with the TLS configuration", func() {
+		Context("when the TLS config is valid", func() {
+			BeforeEach(func() {
+				config.PathToTLSCert = "fixtures/downloader/client.crt"
+				config.PathToTLSKey = "fixtures/downloader/client.key"
+				config.PathToTLSCACert = "fixtures/downloader/ca.crt"
+			})
+
+			It("uses the certs for the uploader and cacheddownloader", func() {
+				// not really an easy way to check this at this layer -- inigo
+				// let's just check that our validation passes
+				Consistently(errCh).ShouldNot(Receive(HaveOccurred()))
+			})
+
+			Context("when no CA cert is provided", func() {
+				BeforeEach(func() {
+					config.PathToTLSCACert = ""
+				})
+
+				It("still passes validation", func() {
+					Consistently(errCh).ShouldNot(Receive(HaveOccurred()))
+				})
+			})
+
+			Context("when a CA cert is provided, but no keypair", func() {
+				BeforeEach(func() {
+					config.PathToTLSCert = ""
+					config.PathToTLSKey = ""
+				})
+
+				It("passes still passes validation", func() {
+					Consistently(errCh).ShouldNot(Receive(HaveOccurred()))
+				})
+			})
+		})
+
+		Context("when the certs are invalid", func() {
+			BeforeEach(func() {
+				config.PathToTLSCert = "fixtures/ca-certs-invalid"
+				config.PathToTLSKey = "fixtures/downloader/client.key"
+				config.PathToTLSCACert = "fixtures/downloader/ca.crt"
+			})
+
+			It("fails", func() {
+				Eventually(errCh).Should(Receive(MatchError(ContainSubstring("failed to find any PEM data in certificate input"))))
+			})
+
+			Context("when the cert is missing", func() {
+				BeforeEach(func() {
+					config.PathToTLSCert = ""
+				})
+
+				It("fails", func() {
+					Eventually(errCh).Should(Receive(MatchError(ContainSubstring("The TLS certificate or key is missing"))))
+				})
+			})
+
+			Context("when the key is missing", func() {
+				BeforeEach(func() {
+					config.PathToTLSKey = ""
+				})
+
+				It("fails", func() {
+					Eventually(errCh).Should(Receive(MatchError(ContainSubstring("The TLS certificate or key is missing"))))
+				})
+			})
+		})
+
+		Context("when the TLS properties are missing", func() {
+			It("succeeds", func() {
+				// not really an easy way to check this at this layer -- inigo
+				// let's just check that our validation passes
+				Consistently(errCh).ShouldNot(Receive(HaveOccurred()))
+			})
 		})
 	})
 
 	Describe("configuring trusted CA bundle", func() {
 		Context("when valid", func() {
 			BeforeEach(func() {
-				config.CACertsForDownloads = []byte(`-----BEGIN CERTIFICATE-----
-MIIBdzCCASOgAwIBAgIBADALBgkqhkiG9w0BAQUwEjEQMA4GA1UEChMHQWNtZSBD
-bzAeFw03MDAxMDEwMDAwMDBaFw00OTEyMzEyMzU5NTlaMBIxEDAOBgNVBAoTB0Fj
-bWUgQ28wWjALBgkqhkiG9w0BAQEDSwAwSAJBAN55NcYKZeInyTuhcCwFMhDHCmwa
-IUSdtXdcbItRB/yfXGBhiex00IaLXQnSU+QZPRZWYqeTEbFSgihqi1PUDy8CAwEA
-AaNoMGYwDgYDVR0PAQH/BAQDAgCkMBMGA1UdJQQMMAoGCCsGAQUFBwMBMA8GA1Ud
-EwEB/wQFMAMBAf8wLgYDVR0RBCcwJYILZXhhbXBsZS5jb22HBH8AAAGHEAAAAAAA
-AAAAAAAAAAAAAAEwCwYJKoZIhvcNAQEFA0EAAoQn/ytgqpiLcZu9XKbCJsJcvkgk
-Se6AbGXgSlq+ZCEVo0qIwSgeBqmsJxUu7NCSOwVJLYNEBO2DtIxoYVk+MA==
------END CERTIFICATE-----
------BEGIN CERTIFICATE-----
-MIIFATCCAuugAwIBAgIBATALBgkqhkiG9w0BAQswEjEQMA4GA1UEAxMHZGllZ29D
-QTAeFw0xNjAyMTYyMTU1MzNaFw0yNjAyMTYyMTU1NDZaMBIxEDAOBgNVBAMTB2Rp
-ZWdvQ0EwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQC7N7lGx7QGqkMd
-wjqgkr09CPoV3HW+GL+YOPajf//CCo15t3mLu9Npv7O7ecb+g/6DxEOtHFpQBSbQ
-igzHZkdlBJEGknwH2bsZ4wcVT2vcv2XPAIMDrnT7VuF1S2XD7BJK3n6BeXkFsVPA
-OUjC/v0pM/rCFRId5CwtRD/0IHFC/qgEtFQx+zejXXEn1AJMzvNNJ3B0bd8VQGEX
-ppemZXS1QvTP7/j2h7fJjosyoL6+76k4mcoScmWFNJHKcG4qcAh8rdnDlw+hJ+5S
-z73CadYI2BTnlZ/fxEcsZ/kcteFSf0mFpMYX6vs9/us/rgGwjUNzg+JlzvF43TYY
-VQ+TRkFUYHhDv3xwuRHnPNe0Nm30esKpqvbSXtoS6jcnpHn9tMOU0+4NW4aEdy9s
-7l4lcGyih4qZfHbYTsRDk1Nrq5EzQbhlZSPC3nxMrLxXri7j22rVCY/Rj9IgAxwC
-R3KcCdADGJeNOw44bK/BsRrB+Hxs9yNpXc2V2dez+w3hKNuzyk7WydC3fgXxX6x8
-66xnlhFGor7fvM0OSMtGUBD16igh4ySdDiEMNUljqQ1DuMglT1eGdg+Kh+1YYWpz
-v3JkNTX96C80IivbZyunZ2CczFhW2HlGWZLwNKeuM0hxt6AmiEa+KJQkx73dfg3L
-tkDWWp9TXERPI/6Y2696INi0wElBUQIDAQABo2YwZDAOBgNVHQ8BAf8EBAMCAAYw
-EgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQU5xGtUKEzsfGmk/Siqo4fgAMs
-TBwwHwYDVR0jBBgwFoAU5xGtUKEzsfGmk/Siqo4fgAMsTBwwCwYJKoZIhvcNAQEL
-A4ICAQBkWgWl2t5fd4PZ1abpSQNAtsb2lfkkpxcKw+Osn9MeGpcrZjP8XoVTxtUs
-GMpeVn2dUYY1sxkVgUZ0Epsgl7eZDK1jn6QfWIjltlHvDtJMh0OrxmdJUuHTGIHc
-lsI9NGQRUtbyFHmy6jwIF7q925OmPQ/A6Xgkb45VUJDGNwOMUL5I9LbdBXcjmx6F
-ZifEON3wxDBVMIAoS/mZYjP4zy2k1qE2FHoitwDccnCG5Wya+AHdZv/ZlfJcuMtU
-U82oyHOctH29BPwASs3E1HUKof6uxJI+Y1M2kBDeuDS7DWiTt3JIVCjewIIhyYYw
-uTPbQglqhqHr1RWohliDmKSroIil68s42An0fv9sUr0Btf4itKS1gTb4rNiKTZC/
-8sLKs+CA5MB+F8lCllGGFfv1RFiUZBQs9+YEE+ru+yJw39lHeZQsEUgHbLjbVHs1
-WFqiKTO8VKl1/eGwG0l9dI26qisIAa/I7kLjlqboKycGDmAAarsmcJBLPzS+ytiu
-hoxA/fLhSWJvPXbdGemXLWQGf5DLN/8QGB63Rjp9WC3HhwSoU0NvmNmHoh+AdRRT
-dYbCU/DMZjsv+Pt9flhj7ELLo+WKHyI767hJSq9A7IT3GzFt8iGiEAt1qj2yS0DX
-36hwbfc1Gh/8nKgFeLmPOlBfKncjTjL2FvBNap6a8tVHXO9FvQ==
------END CERTIFICATE-----`)
+				config.PathToCACertsForDownloads = "fixtures/ca-certs"
 			})
 
 			It("uses it for the cached downloader", func() {
@@ -194,15 +312,263 @@ dYbCU/DMZjsv+Pt9flhj7ELLo+WKHyI767hJSq9A7IT3GzFt8iGiEAt1qj2yS0DX
 				// let's just check that our validation passes
 				Consistently(errCh).ShouldNot(Receive(HaveOccurred()))
 			})
+
+			Context("when the cert bundle has extra leading and trailing spaces", func() {
+				BeforeEach(func() {
+					config.PathToCACertsForDownloads = "fixtures/ca-certs-with-spaces"
+				})
+
+				It("does not error", func() {
+					Consistently(errCh).ShouldNot(Receive(HaveOccurred()))
+				})
+			})
+
+			Context("when the cert bundle is empty", func() {
+				BeforeEach(func() {
+					config.PathToCACertsForDownloads = "fixtures/ca-certs-empty"
+				})
+
+				It("does not error", func() {
+					Consistently(errCh).ShouldNot(Receive(HaveOccurred()))
+				})
+			})
 		})
 
-		Context("when invalid", func() {
+		Context("when certs are invalid", func() {
 			BeforeEach(func() {
-				config.CACertsForDownloads = []byte("some-stuff")
+				config.PathToCACertsForDownloads = "fixtures/ca-certs-invalid"
 			})
 
 			It("fails", func() {
-				Eventually(errCh).Should(Receive(HaveOccurred()))
+				Eventually(errCh).Should(Receive(MatchError("unable to load CA certificate")))
+			})
+		})
+
+		Context("when path is invalid", func() {
+			BeforeEach(func() {
+				config.PathToCACertsForDownloads = "sandwich"
+			})
+
+			It("fails", func() {
+				Eventually(errCh).Should(Receive(MatchError("Unable to open CA cert bundle 'sandwich'")))
+			})
+		})
+	})
+
+	Describe("TLSConfigFromConfig", func() {
+		var (
+			tlsConfig             *tls.Config
+			caCert                *x509.Certificate
+			tlsClientCert         tls.Certificate
+			fakeCertPoolRetriever *fakes.FakeCertPoolRetriever
+			err                   error
+			logger                *lagertest.TestLogger
+		)
+
+		BeforeEach(func() {
+			logger = lagertest.NewTestLogger("executor")
+			fakeCertPoolRetriever = &fakes.FakeCertPoolRetriever{}
+			config.PathToTLSCert = "fixtures/downloader/client.crt"
+			config.PathToTLSKey = "fixtures/downloader/client.key"
+			config.PathToTLSCACert = "fixtures/downloader/ca.crt"
+
+			fakeCertPoolRetriever.SystemCertsReturns(x509.NewCertPool())
+
+			certBytes, err := ioutil.ReadFile(config.PathToTLSCACert)
+			Expect(err).NotTo(HaveOccurred())
+			block, _ := pem.Decode(certBytes)
+			caCert, err = x509.ParseCertificate(block.Bytes)
+			Expect(err).NotTo(HaveOccurred())
+
+			tlsClientCert, err = tls.LoadX509KeyPair(config.PathToTLSCert, config.PathToTLSKey)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns a valid mutual TLS config", func() {
+			tlsConfig, err = initializer.TLSConfigFromConfig(logger, fakeCertPoolRetriever, config)
+			Expect(err).To(Succeed())
+			Expect(tlsConfig).NotTo(BeNil())
+			Expect(tlsConfig.MinVersion).To(BeEquivalentTo(tls.VersionTLS12))
+			Expect(tlsConfig.InsecureSkipVerify).To(Equal(config.SkipCertVerify))
+			Expect(tlsConfig.Certificates).To(ContainElement(tlsClientCert))
+			Expect(tlsConfig.RootCAs.Subjects()).To(ContainElement(caCert.RawSubject))
+			Expect(tlsConfig.ClientCAs.Subjects()).To(ContainElement(caCert.RawSubject))
+		})
+
+		It("adds any system certs to the CA pools", func() {
+			certBytes, err := ioutil.ReadFile("fixtures/systemcerts/extra-ca.crt")
+			Expect(err).NotTo(HaveOccurred())
+			block, _ := pem.Decode(certBytes)
+			caCert, err = x509.ParseCertificate(block.Bytes)
+			Expect(err).NotTo(HaveOccurred())
+
+			systemCAs := x509.NewCertPool()
+			ok := systemCAs.AppendCertsFromPEM(certBytes)
+			Expect(ok).To(BeTrue())
+			fakeCertPoolRetriever.SystemCertsReturns(systemCAs)
+
+			tlsConfig, err = initializer.TLSConfigFromConfig(logger, fakeCertPoolRetriever, config)
+			Expect(err).To(Succeed())
+			Expect(tlsConfig).NotTo(BeNil())
+
+			Expect(fakeCertPoolRetriever.SystemCertsCallCount()).To(Equal(1))
+			Expect(tlsConfig.RootCAs.Subjects()).To(ContainElement(caCert.RawSubject))
+			Expect(tlsConfig.ClientCAs.Subjects()).To(ContainElement(caCert.RawSubject))
+		})
+
+		It("does not restrict the cipher suites", func() {
+			tlsConfig, err = initializer.TLSConfigFromConfig(logger, fakeCertPoolRetriever, config)
+			Expect(err).To(Succeed())
+			Expect(tlsConfig.CipherSuites).To(BeNil())
+		})
+
+		Context("when mutual is using PathToCACertsForDownloads", func() {
+			BeforeEach(func() {
+				config.PathToTLSCACert = ""
+				config.PathToCACertsForDownloads = "fixtures/downloader/ca.crt"
+
+				certBytes, err := ioutil.ReadFile(config.PathToCACertsForDownloads)
+				Expect(err).NotTo(HaveOccurred())
+				block, _ := pem.Decode(certBytes)
+				caCert, err = x509.ParseCertificate(block.Bytes)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("returns a valid mutual TLS config", func() {
+				tlsConfig, err = initializer.TLSConfigFromConfig(logger, fakeCertPoolRetriever, config)
+				Expect(err).To(Succeed())
+				Expect(tlsConfig).NotTo(BeNil())
+				Expect(tlsConfig.RootCAs.Subjects()).To(ContainElement(caCert.RawSubject))
+				Expect(tlsConfig.ClientCAs.Subjects()).To(ContainElement(caCert.RawSubject))
+			})
+		})
+
+		Context("when tls cert and key are not configured", func() {
+			BeforeEach(func() {
+				logger = lagertest.NewTestLogger("executor")
+				config.PathToTLSKey = ""
+				config.PathToTLSCert = ""
+			})
+
+			It("returns a valid, non-mutual TLS enabled, config", func() {
+				tlsConfig, err = initializer.TLSConfigFromConfig(logger, fakeCertPoolRetriever, config)
+				Expect(err).To(Succeed())
+				Expect(tlsConfig).NotTo(BeNil())
+				Expect(tlsConfig.RootCAs.Subjects()).To(ContainElement(caCert.RawSubject))
+				Expect(tlsConfig.ClientCAs).To(BeNil())
+			})
+		})
+	})
+
+	Describe("CredManagerFromConfig", func() {
+		var credManager containerstore.CredManager
+		var err error
+		var container executor.Container
+		var logger *lagertest.TestLogger
+
+		JustBeforeEach(func() {
+			logger = lagertest.NewTestLogger("executor")
+			container = executor.Container{
+				Guid: "1234",
+			}
+			credManager, err = initializer.CredManagerFromConfig(logger, config, fakeClock)
+		})
+
+		Describe("when instance identity creds directory is not set", func() {
+			BeforeEach(func() {
+				config.InstanceIdentityCredDir = ""
+			})
+
+			It("returns a noop credential manager", func() {
+				bindMounts, _, err := credManager.CreateCredDir(logger, container)
+				Expect(bindMounts).To(BeEmpty())
+				Expect(err).NotTo(HaveOccurred())
+			})
+		})
+
+		Describe("when the instance identity creds directory is set", func() {
+			BeforeEach(func() {
+				config.InstanceIdentityCredDir = "fixtures/instance-id/"
+				config.InstanceIdentityCAPath = "fixtures/instance-id/ca.crt"
+				config.InstanceIdentityPrivateKeyPath = "fixtures/instance-id/ca.key"
+				config.InstanceIdentityValidityPeriod = durationjson.Duration(1 * time.Minute)
+			})
+
+			It("returns a credential manager", func() {
+				bindMounts, _, err := credManager.CreateCredDir(logger, container)
+				defer os.RemoveAll(filepath.Join(config.InstanceIdentityCredDir, container.Guid))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(bindMounts).NotTo(BeEmpty())
+			})
+
+			Context("when the private key does not exist", func() {
+				BeforeEach(func() {
+					config.InstanceIdentityPrivateKeyPath = "fixtures/instance-id/notexist.key"
+				})
+
+				It("fails", func() {
+					Eventually(os.IsNotExist(err)).Should(BeTrue(), "Private key does not exist")
+				})
+			})
+
+			Context("when the private key is not PEM-encoded", func() {
+				BeforeEach(func() {
+					config.InstanceIdentityPrivateKeyPath = "fixtures/instance-id/non-pem.key"
+				})
+
+				It("fails", func() {
+					Eventually(err).Should(MatchError(ContainSubstring("instance ID key is not PEM-encoded")))
+				})
+			})
+
+			Context("when the private key is invalid", func() {
+				BeforeEach(func() {
+					config.InstanceIdentityPrivateKeyPath = "fixtures/instance-id/invalid.key"
+				})
+
+				It("fails", func() {
+					Eventually(err).Should(BeAssignableToTypeOf(asn1.StructuralError{}))
+				})
+			})
+
+			Context("when the certificate does not exist", func() {
+				BeforeEach(func() {
+					config.InstanceIdentityCAPath = "fixtures/instance-id/notexist.crt"
+				})
+
+				It("fails", func() {
+					Eventually(os.IsNotExist(err)).Should(BeTrue(), "Instance certificate does not exist")
+				})
+			})
+
+			Context("when the certificate is not PEM-encoded", func() {
+				BeforeEach(func() {
+					config.InstanceIdentityCAPath = "fixtures/instance-id/non-pem.crt"
+				})
+
+				It("fails", func() {
+					Eventually(err).Should(MatchError(ContainSubstring("instance ID CA is not PEM-encoded")))
+				})
+			})
+
+			Context("when the certificate is invalid", func() {
+				BeforeEach(func() {
+					config.InstanceIdentityCAPath = "fixtures/instance-id/invalid.crt"
+				})
+
+				It("fails", func() {
+					Eventually(err).Should(BeAssignableToTypeOf(asn1.StructuralError{}))
+				})
+			})
+
+			Context("when the validity period is not set", func() {
+				BeforeEach(func() {
+					config.InstanceIdentityValidityPeriod = 0
+				})
+
+				It("fails", func() {
+					Eventually(err).Should(MatchError(ContainSubstring("instance ID validity period needs to be set and positive")))
+				})
 			})
 		})
 	})

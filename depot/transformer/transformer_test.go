@@ -10,15 +10,16 @@ import (
 	"code.cloudfoundry.org/executor"
 	"code.cloudfoundry.org/executor/depot/log_streamer"
 	"code.cloudfoundry.org/executor/depot/transformer"
+	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/garden/gardenfakes"
 	"code.cloudfoundry.org/lager"
 	"code.cloudfoundry.org/lager/lagertest"
-	"github.com/cloudfoundry-incubator/garden"
-	"github.com/cloudfoundry/gunk/workpool"
+	"code.cloudfoundry.org/workpool"
+	mfakes "code.cloudfoundry.org/go-loggregator/loggregator_v2/fakes"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/tedsuo/ifrit"
 
-	gfakes "github.com/cloudfoundry-incubator/garden/fakes"
 	"bytes"
 	"io"
 	"io/ioutil"
@@ -27,22 +28,24 @@ import (
 var _ = Describe("Transformer", func() {
 	Describe("StepsRunner", func() {
 		var (
-			logger          lager.Logger
-			optimusPrime    transformer.Transformer
-			container       executor.Container
-			logStreamer     log_streamer.LogStreamer
-			gardenContainer *gfakes.FakeContainer
-			clock           *fakeclock.FakeClock
+			logger           lager.Logger
+			optimusPrime     transformer.Transformer
+			container        executor.Container
+			logStreamer      log_streamer.LogStreamer
+			gardenContainer  *gardenfakes.FakeContainer
+			clock            *fakeclock.FakeClock
+			fakeMetronClient *mfakes.FakeClient
 		)
 
 		BeforeEach(func() {
-			gardenContainer = &gfakes.FakeContainer{}
+			gardenContainer = &gardenfakes.FakeContainer{}
 			gardenContainer.StreamOutStub = func(spec garden.StreamOutSpec) (io.ReadCloser, error) {
 				return ioutil.NopCloser(bytes.NewReader([]byte(""))), nil
 			}
 
 			logger = lagertest.NewTestLogger("test-container-store")
-			logStreamer = log_streamer.New("test", "test", 1)
+			fakeMetronClient = &mfakes.FakeClient{}
+			logStreamer = log_streamer.New("test", "test", 1, fakeMetronClient)
 
 			healthyMonitoringInterval := 1 * time.Millisecond
 			unhealthyMonitoringInterval := 1 * time.Millisecond
@@ -101,7 +104,7 @@ var _ = Describe("Transformer", func() {
 		It("returns a step encapsulating setup, post-setup, monitor, and action", func() {
 			setupReceived := make(chan struct{})
 			postSetupReceived := make(chan struct{})
-			monitorProcess := &gfakes.FakeProcess{}
+			monitorProcess := &gardenfakes.FakeProcess{}
 			gardenContainer.RunStub = func(processSpec garden.ProcessSpec, processIO garden.ProcessIO) (garden.Process, error) {
 				if processSpec.Path == "/setup/path" {
 					setupReceived <- struct{}{}
@@ -110,7 +113,7 @@ var _ = Describe("Transformer", func() {
 				} else if processSpec.Path == "/monitor/path" {
 					return monitorProcess, nil
 				}
-				return &gfakes.FakeProcess{}, nil
+				return &gardenfakes.FakeProcess{}, nil
 			}
 
 			monitorProcess.WaitStub = func() (int, error) {
@@ -172,7 +175,7 @@ var _ = Describe("Transformer", func() {
 			})
 
 			It("returns a codependent step for the action/monitor", func() {
-				gardenContainer.RunReturns(&gfakes.FakeProcess{}, nil)
+				gardenContainer.RunReturns(&gardenfakes.FakeProcess{}, nil)
 
 				runner, err := optimusPrime.StepsRunner(logger, container, gardenContainer, logStreamer)
 				Expect(err).NotTo(HaveOccurred())
@@ -202,7 +205,7 @@ var _ = Describe("Transformer", func() {
 			})
 
 			It("does not run the monitor step and immediately says the healthcheck passed", func() {
-				gardenContainer.RunReturns(&gfakes.FakeProcess{}, nil)
+				gardenContainer.RunReturns(&gardenfakes.FakeProcess{}, nil)
 
 				runner, err := optimusPrime.StepsRunner(logger, container, gardenContainer, logStreamer)
 				Expect(err).NotTo(HaveOccurred())

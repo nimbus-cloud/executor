@@ -1,19 +1,19 @@
 package fakes
 
 import (
-	"github.com/cloudfoundry-incubator/garden"
-	"github.com/cloudfoundry-incubator/garden/client"
-	"github.com/cloudfoundry-incubator/garden/client/connection/fakes"
+	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/garden/client"
+	"code.cloudfoundry.org/garden/client/connection/connectionfakes"
 )
 
 type FakeGardenClient struct {
 	garden.Client
 
-	Connection *fakes.FakeConnection
+	Connection *connectionfakes.FakeConnection
 }
 
 func NewGardenClient() *FakeGardenClient {
-	connection := new(fakes.FakeConnection)
+	connection := new(connectionfakes.FakeConnection)
 
 	return &FakeGardenClient{
 		Connection: connection,

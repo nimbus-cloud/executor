@@ -7,10 +7,10 @@ import (
 	"code.cloudfoundry.org/executor"
 	"code.cloudfoundry.org/executor/depot/containerstore"
 	"code.cloudfoundry.org/executor/depot/event"
+	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/lager"
 	"code.cloudfoundry.org/volman"
-	"github.com/cloudfoundry-incubator/garden"
-	"github.com/cloudfoundry/gunk/workpool"
+	"code.cloudfoundry.org/workpool"
 )
 
 const ContainerStoppedBeforeRunMessage = "Container stopped by user"
@@ -75,7 +75,7 @@ func (c *client) Cleanup(logger lager.Logger) {
 	c.deletionWorkPool.Stop()
 	c.readWorkPool.Stop()
 	c.metricsWorkPool.Stop()
-	c.containerStore.Cleanup()
+	c.containerStore.Cleanup(logger)
 }
 
 func (c *client) AllocateContainers(logger lager.Logger, requests []executor.AllocationRequest) ([]executor.AllocationFailure, error) {

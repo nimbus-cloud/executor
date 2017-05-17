@@ -11,11 +11,11 @@ import (
 	"code.cloudfoundry.org/executor"
 	"code.cloudfoundry.org/executor/depot/event"
 	"code.cloudfoundry.org/executor/depot/transformer"
+	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/garden/server"
 	"code.cloudfoundry.org/lager"
-	"code.cloudfoundry.org/runtimeschema/metric"
 	"code.cloudfoundry.org/volman"
-	"github.com/cloudfoundry-incubator/garden"
-	"github.com/cloudfoundry-incubator/garden/server"
+	"code.cloudfoundry.org/go-loggregator/loggregator_v2"
 	"github.com/tedsuo/ifrit"
 )
 
@@ -25,12 +25,21 @@ const ContainerExpirationMessage = "expired container"
 const ContainerMissingMessage = "missing garden container"
 const VolmanMountFailed = "failed to mount volume"
 const BindMountCleanupFailed = "failed to cleanup bindmount artifacts"
+const CredDirFailed = "failed to create credentials directory"
 
-const GardenContainerCreationDuration = metric.Duration("GardenContainerCreationDuration")
+// To be deprecated
+const (
+	GardenContainerCreationDuration             = "GardenContainerCreationDuration"
+	GardenContainerCreationSucceededDuration    = "GardenContainerCreationSucceededDuration"
+	GardenContainerCreationFailedDuration       = "GardenContainerCreationFailedDuration"
+	GardenContainerDestructionSucceededDuration = "GardenContainerDestructionSucceededDuration"
+	GardenContainerDestructionFailedDuration    = "GardenContainerDestructionFailedDuration"
+)
 
 type storeNode struct {
 	modifiedIndex               uint
 	hostTrustedCertificatesPath string
+	metronClient                loggregator_v2.Client
 
 	// infoLock protects modifying info and swapping gardenContainer pointers
 	infoLock           *sync.Mutex
@@ -39,14 +48,16 @@ type storeNode struct {
 	gardenContainer    garden.Container
 
 	// opLock serializes public methods that involve garden interactions
-	opLock            *sync.Mutex
-	gardenClient      garden.Client
-	dependencyManager DependencyManager
-	volumeManager     volman.Manager
-	eventEmitter      event.Hub
-	transformer       transformer.Transformer
-	process           ifrit.Process
-	config            *ContainerConfig
+	opLock             *sync.Mutex
+	gardenClient       garden.Client
+	dependencyManager  DependencyManager
+	volumeManager      volman.Manager
+	credManager        CredManager
+	eventEmitter       event.Hub
+	transformer        transformer.Transformer
+	process            ifrit.Process
+	credManagerProcess ifrit.Process
+	config             *ContainerConfig
 }
 
 func newStoreNode(
@@ -55,9 +66,11 @@ func newStoreNode(
 	gardenClient garden.Client,
 	dependencyManager DependencyManager,
 	volumeManager volman.Manager,
+	credManager CredManager,
 	eventEmitter event.Hub,
 	transformer transformer.Transformer,
 	hostTrustedCertificatesPath string,
+	metronClient loggregator_v2.Client,
 ) *storeNode {
 	return &storeNode{
 		config:                      config,
@@ -67,10 +80,12 @@ func newStoreNode(
 		gardenClient:                gardenClient,
 		dependencyManager:           dependencyManager,
 		volumeManager:               volumeManager,
+		credManager:                 credManager,
 		eventEmitter:                eventEmitter,
 		transformer:                 transformer,
 		modifiedIndex:               0,
 		hostTrustedCertificatesPath: hostTrustedCertificatesPath,
+		metronClient:                metronClient,
 	}
 }
 
@@ -129,7 +144,7 @@ func (n *storeNode) Create(logger lager.Logger) error {
 		return executor.ErrInvalidTransition
 	}
 
-	logStreamer := logStreamerFromLogConfig(info.LogConfig)
+	logStreamer := logStreamerFromLogConfig(info.LogConfig, n.metronClient)
 
 	mounts, err := n.dependencyManager.DownloadCachedDependencies(logger, info.CachedDependencies, logStreamer)
 	if err != nil {
@@ -154,6 +169,14 @@ func (n *storeNode) Create(logger lager.Logger) error {
 		return err
 	}
 	mounts.GardenBindMounts = append(mounts.GardenBindMounts, volumeMounts...)
+
+	credMounts, envs, err := n.credManager.CreateCredDir(logger, n.info)
+	if err != nil {
+		n.complete(logger, true, CredDirFailed)
+		return err
+	}
+	mounts.GardenBindMounts = append(mounts.GardenBindMounts, credMounts...)
+	info.Env = append(info.Env, envs...)
 
 	fmt.Fprintf(logStreamer.Stdout(), "Creating container\n")
 	gardenContainer, err := n.createGardenContainer(logger, &info, mounts.GardenBindMounts)
@@ -205,10 +228,27 @@ func (n *storeNode) gardenProperties(container *executor.Container) garden.Prope
 }
 
 func (n *storeNode) createGardenContainer(logger lager.Logger, info *executor.Container, mounts []garden.BindMount) (garden.Container, error) {
+	netOutRules, err := convertEgressToNetOut(logger, info.EgressRules)
+	if err != nil {
+		return nil, err
+	}
+
+	netInRules := make([]garden.NetIn, len(info.Ports))
+	for i, portMapping := range info.Ports {
+		netInRules[i] = garden.NetIn{
+			HostPort:      uint32(portMapping.HostPort),
+			ContainerPort: uint32(portMapping.ContainerPort),
+		}
+	}
+
 	containerSpec := garden.ContainerSpec{
 		Handle:     info.Guid,
 		Privileged: info.Privileged,
-		RootFSPath: info.RootFSPath,
+		Image: garden.ImageRef{
+			URI:      info.RootFSPath,
+			Username: info.ImageUsername,
+			Password: info.ImagePassword,
+		},
 		Env:        convertEnvVars(info.Env),
 		BindMounts: mounts,
 		Limits: garden.Limits{
@@ -220,41 +260,40 @@ func (n *storeNode) createGardenContainer(logger lager.Logger, info *executor.Co
 				InodeHard: n.config.INodeLimit,
 				Scope:     convertDiskScope(info.DiskScope),
 			},
+			Pid: garden.PidLimits{
+				Max: uint64(info.MaxPids),
+			},
 			CPU: garden.CPULimits{
 				LimitInShares: uint64(float64(n.config.MaxCPUShares) * float64(info.CPUWeight) / 100.0),
 			},
 		},
 		Properties: n.gardenProperties(info),
+		NetIn:      netInRules,
+		NetOut:     netOutRules,
 	}
 
-	netOutRules, err := convertEgressToNetOut(logger, info.EgressRules)
+	gardenContainer, err := createContainer(logger, containerSpec, n.gardenClient, n.metronClient)
 	if err != nil {
 		return nil, err
 	}
 
-	gardenContainer, err := createContainer(logger, containerSpec, n.gardenClient)
+	containerInfo, err := gardenContainer.Info()
 	if err != nil {
 		return nil, err
 	}
 
-	err = setupNetOutOnContainer(logger, netOutRules, gardenContainer)
-	if err != nil {
-		n.destroyContainer(logger)
-		return nil, err
+	info.Ports = make([]executor.PortMapping, len(containerInfo.MappedPorts))
+	for i, portMapping := range containerInfo.MappedPorts {
+		info.Ports[i] = executor.PortMapping{HostPort: uint16(portMapping.HostPort), ContainerPort: uint16(portMapping.ContainerPort)}
 	}
 
-	info.Ports, err = setupNetInOnContainer(logger, info.Ports, gardenContainer)
-	if err != nil {
-		n.destroyContainer(logger)
-		return nil, err
-	}
-
-	externalIP, err := fetchExternalIp(logger, gardenContainer)
+	externalIP, containerIP, err := fetchIPs(logger, gardenContainer)
 	if err != nil {
 		n.destroyContainer(logger)
 		return nil, err
 	}
 	info.ExternalIP = externalIP
+	info.InternalIP = containerIP
 
 	err = info.TransistionToCreate()
 	if err != nil {
@@ -278,19 +317,44 @@ func (n *storeNode) Run(logger lager.Logger) error {
 		return executor.ErrInvalidTransition
 	}
 
-	logStreamer := logStreamerFromLogConfig(n.info.LogConfig)
+	logStreamer := logStreamerFromLogConfig(n.info.LogConfig, n.metronClient)
 
 	runner, err := n.transformer.StepsRunner(logger, n.info, n.gardenContainer, logStreamer)
 	if err != nil {
 		return err
 	}
 
-	n.process = ifrit.Background(runner)
-	go n.run(logger)
+	credManagerRunner := n.credManager.Runner(logger, n.info)
+
+	n.credManagerProcess = ifrit.Background(credManagerRunner)
+	// we cannot use a group here because it messes up with the error messages returned from the runners, e.g.
+	//   cred-manager-runner exited with error: BOOOM
+	//   container-runner exited with nil
+	// instead of just
+	//   BOOM
+	// nomrally this is informative and good but looks like cc
+	// FailureReasonSanitizer depends on some errors messages having a specific
+	// structure
+
+	// wait for cred manager to start
+	select {
+	case <-n.credManagerProcess.Ready():
+		n.process = ifrit.Background(runner)
+		go n.run(logger)
+	case err := <-n.credManagerProcess.Wait():
+		if err != nil {
+			logger.Error("cred-manager-exited", err)
+			n.complete(logger, true, "cred-manager-runner exited: "+err.Error())
+		} else {
+			logger.Info("cred-manager-exited-without-error")
+			n.complete(logger, false, "")
+		}
+	}
 	return nil
 }
 
 func (n *storeNode) run(logger lager.Logger) {
+	// wait for container runner to start
 	logger.Debug("execute-process")
 	<-n.process.Ready()
 	logger.Debug("healthcheck-passed")
@@ -301,9 +365,24 @@ func (n *storeNode) run(logger lager.Logger) {
 	n.infoLock.Unlock()
 	go n.eventEmitter.Emit(executor.NewContainerRunningEvent(info))
 
-	err := <-n.process.Wait()
-	if err != nil {
-		n.complete(logger, true, err.Error())
+	var errorStr string
+	select {
+	case err := <-n.credManagerProcess.Wait():
+		if err != nil {
+			errorStr = "cred-manager-runner exited: " + err.Error()
+		}
+		n.process.Signal(os.Interrupt)
+		n.process.Wait()
+	case err := <-n.process.Wait():
+		if err != nil {
+			errorStr = err.Error()
+		}
+		n.credManagerProcess.Signal(os.Interrupt)
+		n.credManagerProcess.Wait()
+	}
+
+	if errorStr != "" {
+		n.complete(logger, true, errorStr)
 	} else {
 		n.complete(logger, false, "")
 	}
@@ -345,7 +424,7 @@ func (n *storeNode) Destroy(logger lager.Logger) error {
 		<-n.process.Wait()
 	}
 
-	logStreamer := logStreamerFromLogConfig(n.info.LogConfig)
+	logStreamer := logStreamerFromLogConfig(n.info.LogConfig, n.metronClient)
 
 	fmt.Fprintf(logStreamer.Stdout(), "Destroying container\n")
 	err = n.destroyContainer(logger)
@@ -356,8 +435,10 @@ func (n *storeNode) Destroy(logger lager.Logger) error {
 	fmt.Fprintf(logStreamer.Stdout(), "Successfully destroyed container\n")
 
 	n.infoLock.Lock()
-	cacheKeys := n.bindMountCacheKeys
+	info := n.info.Copy()
 	n.infoLock.Unlock()
+
+	cacheKeys := n.bindMountCacheKeys
 
 	var bindMountCleanupErr error
 	err = n.dependencyManager.ReleaseCachedDependencies(logger, cacheKeys)
@@ -366,33 +447,42 @@ func (n *storeNode) Destroy(logger lager.Logger) error {
 		bindMountCleanupErr = errors.New(BindMountCleanupFailed)
 	}
 
-	for _, volume := range n.info.VolumeMounts {
+	for _, volume := range info.VolumeMounts {
 		err = n.volumeManager.Unmount(logger, volume.Driver, volume.VolumeId)
 		if err != nil {
 			logger.Error("failed-to-unmount-volume", err)
 			bindMountCleanupErr = errors.New(BindMountCleanupFailed)
 		}
 	}
-
 	return bindMountCleanupErr
 }
 
 func (n *storeNode) destroyContainer(logger lager.Logger) error {
 	logger.Debug("destroying-garden-container")
 
+	startTime := time.Now()
 	err := n.gardenClient.Destroy(n.info.Guid)
+	destroyDuration := time.Now().Sub(startTime)
+
 	if err != nil {
 		if _, ok := err.(garden.ContainerNotFoundError); ok {
 			logger.Error("container-not-found-in-garden", err)
 		} else if err.Error() == server.ErrConcurrentDestroy.Error() {
 			logger.Error("container-destroy-in-progress", err)
 		} else {
-			logger.Error("failed-to-delete-garden-container", err)
+			logger.Error("failed-to-destroy-container-in-garden", err)
+			logger.Info("failed-to-destroy-container-in-garden", lager.Data{
+				"destroy-took": destroyDuration.String(),
+			})
+			sendMetricDuration(logger, GardenContainerDestructionFailedDuration, destroyDuration, n.metronClient)
 			return err
 		}
 	}
 
-	logger.Debug("destroyed-garden-container")
+	logger.Info("destroyed-container-in-garden", lager.Data{
+		"destroy-took": destroyDuration.String(),
+	})
+	sendMetricDuration(logger, GardenContainerDestructionSucceededDuration, destroyDuration, n.metronClient)
 	return nil
 }
 
@@ -436,60 +526,53 @@ func (n *storeNode) complete(logger lager.Logger, failed bool, failureReason str
 	go n.eventEmitter.Emit(executor.NewContainerCompleteEvent(n.info))
 }
 
-func setupNetInOnContainer(logger lager.Logger, ports []executor.PortMapping, gardenContainer garden.Container) ([]executor.PortMapping, error) {
-	actualPortMappings := make([]executor.PortMapping, len(ports))
-	for i, portMapping := range ports {
-		logger.Debug("net-in")
-		actualHost, actualContainerPort, err := gardenContainer.NetIn(uint32(portMapping.HostPort), uint32(portMapping.ContainerPort))
-		if err != nil {
-			logger.Error("net-in-failed", err)
-			return nil, err
+func sendMetricDuration(logger lager.Logger, metric string, value time.Duration, metronClient loggregator_v2.Client) {
+	err := metronClient.SendDuration(metric, value)
+	if err != nil {
+		switch metric {
+		case GardenContainerCreationDuration:
+			logger.Error("failed-to-send-garden-container-creation-duration-metric", err)
+		case GardenContainerCreationSucceededDuration:
+			logger.Error("failed-to-send-garden-container-creation-succeeded-duration-metric", err)
+		case GardenContainerCreationFailedDuration:
+			logger.Error("failed-to-send-garden-container-creation-failed-duration-metric", err)
+		case GardenContainerDestructionSucceededDuration:
+			logger.Error("failed-to-send-garden-container-destruction-succeeded-duration-metric", err)
+		case GardenContainerDestructionFailedDuration:
+			logger.Error("failed-to-send-garden-container-destruction-failed-duration-metric", err)
+		default:
+			logger.Error("failed-to-send-metric", err)
 		}
-		logger.Debug("net-in-complete")
-		actualPortMappings[i].ContainerPort = uint16(actualContainerPort)
-		actualPortMappings[i].HostPort = uint16(actualHost)
 	}
-	return actualPortMappings, nil
 }
 
-func setupNetOutOnContainer(logger lager.Logger, netOutRules []garden.NetOutRule, gardenContainer garden.Container) error {
-	for i := range netOutRules {
-		logger.Debug("net-out")
-		err := gardenContainer.NetOut(netOutRules[i])
-		if err != nil {
-			logger.Error("net-out-failed", err)
-			return err
-		}
-		logger.Debug("net-out-complete")
-	}
-	return nil
-}
-
-func createContainer(logger lager.Logger, spec garden.ContainerSpec, client garden.Client) (garden.Container, error) {
+func createContainer(logger lager.Logger, spec garden.ContainerSpec, client garden.Client, metronClient loggregator_v2.Client) (garden.Container, error) {
 	logger.Info("creating-container-in-garden")
 	startTime := time.Now()
 	container, err := client.Create(spec)
 	createDuration := time.Now().Sub(startTime)
 	if err != nil {
-		logger.Error("failed-to-creating-container-in-garden", err, lager.Data{"create-took": createDuration.String()})
+		logger.Error("failed-to-create-container-in-garden", err)
+		logger.Info("failed-to-create-container-in-garden", lager.Data{
+			"create-took": createDuration.String(),
+		})
+		sendMetricDuration(logger, GardenContainerCreationFailedDuration, createDuration, metronClient)
 		return nil, err
 	}
 	logger.Info("created-container-in-garden", lager.Data{"create-took": createDuration.String()})
-	err = GardenContainerCreationDuration.Send(createDuration)
-	if err != nil {
-		logger.Error("failed-to-send-garden-container-creation-duration-metric", err)
-	}
+	sendMetricDuration(logger, GardenContainerCreationDuration, createDuration, metronClient)
+	sendMetricDuration(logger, GardenContainerCreationSucceededDuration, createDuration, metronClient)
 	return container, nil
 }
 
-func fetchExternalIp(logger lager.Logger, gardenContainer garden.Container) (string, error) {
+func fetchIPs(logger lager.Logger, gardenContainer garden.Container) (string, string, error) {
 	logger.Debug("container-info")
 	gardenInfo, err := gardenContainer.Info()
 	if err != nil {
 		logger.Error("failed-container-info", err)
-		return "", err
+		return "", "", err
 	}
 	logger.Debug("container-info-complete")
 
-	return gardenInfo.ExternalIP, nil
+	return gardenInfo.ExternalIP, gardenInfo.ContainerIP, nil
 }

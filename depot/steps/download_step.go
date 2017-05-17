@@ -9,8 +9,8 @@ import (
 	"code.cloudfoundry.org/bytefmt"
 	"code.cloudfoundry.org/cacheddownloader"
 	"code.cloudfoundry.org/executor/depot/log_streamer"
+	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/lager"
-	"github.com/cloudfoundry-incubator/garden"
 )
 
 type downloadStep struct {
@@ -108,6 +108,7 @@ func (step *downloadStep) fetch() (io.ReadCloser, int64, error) {
 	}
 
 	tarStream, downloadedSize, err := step.cachedDownloader.Fetch(
+		step.logger.Session("downloader"),
 		url,
 		step.model.CacheKey,
 		cacheddownloader.ChecksumInfoType{

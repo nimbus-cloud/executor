@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"errors"
 	"io/ioutil"
+	"net"
 	"os"
+	"sync"
 	"time"
 
-	"github.com/cloudfoundry/dropsonde/log_sender/fake"
-	"github.com/cloudfoundry/dropsonde/logs"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gbytes"
@@ -21,14 +21,15 @@ import (
 	"code.cloudfoundry.org/executor/depot/containerstore"
 	"code.cloudfoundry.org/executor/depot/containerstore/containerstorefakes"
 	"code.cloudfoundry.org/executor/depot/transformer/faketransformer"
+	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/lager"
 	"code.cloudfoundry.org/volman"
 	"code.cloudfoundry.org/volman/volmanfakes"
-	"github.com/cloudfoundry-incubator/garden"
+	mfakes "code.cloudfoundry.org/go-loggregator/loggregator_v2/fakes"
 
 	eventfakes "code.cloudfoundry.org/executor/depot/event/fakes"
-	gfakes "github.com/cloudfoundry-incubator/garden/fakes"
-	"github.com/cloudfoundry-incubator/garden/server"
+	"code.cloudfoundry.org/garden/gardenfakes"
+	"code.cloudfoundry.org/garden/server"
 )
 
 var _ = Describe("Container Store", func() {
@@ -42,15 +43,19 @@ var _ = Describe("Container Store", func() {
 
 		containerGuid string
 
-		gardenClient      *gfakes.FakeClient
-		gardenContainer   *gfakes.FakeContainer
+		metricMap     map[string]struct{}
+		metricMapLock sync.RWMutex
+
+		gardenClient      *gardenfakes.FakeClient
+		gardenContainer   *gardenfakes.FakeContainer
 		megatron          *faketransformer.FakeTransformer
 		dependencyManager *containerstorefakes.FakeDependencyManager
+		credManager       *containerstorefakes.FakeCredManager
 		volumeManager     *volmanfakes.FakeManager
 
-		clock        *fakeclock.FakeClock
-		eventEmitter *eventfakes.FakeHub
-		fakeSender   *fake.FakeLogSender
+		clock            *fakeclock.FakeClock
+		eventEmitter     *eventfakes.FakeHub
+		fakeMetronClient *mfakes.FakeClient
 	)
 
 	var pollForComplete = func(guid string) func() bool {
@@ -61,13 +66,39 @@ var _ = Describe("Container Store", func() {
 		}
 	}
 
+	var pollForRunning = func(guid string) func() bool {
+		return func() bool {
+			container, err := containerStore.Get(logger, guid)
+			Expect(err).NotTo(HaveOccurred())
+			return container.State == executor.StateRunning
+		}
+	}
+
+	getMetrics := func() map[string]struct{} {
+		metricMapLock.Lock()
+		defer metricMapLock.Unlock()
+		m := make(map[string]struct{}, len(metricMap))
+		for k, v := range metricMap {
+			m[k] = v
+		}
+		return m
+	}
+
 	BeforeEach(func() {
-		gardenContainer = &gfakes.FakeContainer{}
-		gardenClient = &gfakes.FakeClient{}
+		metricMap = map[string]struct{}{}
+		gardenContainer = &gardenfakes.FakeContainer{}
+		gardenClient = &gardenfakes.FakeClient{}
 		dependencyManager = &containerstorefakes.FakeDependencyManager{}
+		credManager = &containerstorefakes.FakeCredManager{}
 		volumeManager = &volmanfakes.FakeManager{}
 		clock = fakeclock.NewFakeClock(time.Now())
 		eventEmitter = &eventfakes.FakeHub{}
+
+		credManager.RunnerReturns(ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
+			close(ready)
+			<-signals
+			return nil
+		}))
 
 		iNodeLimit = 64
 		maxCPUShares = 100
@@ -77,8 +108,8 @@ var _ = Describe("Container Store", func() {
 		containerGuid = "container-guid"
 
 		megatron = &faketransformer.FakeTransformer{}
-		fakeSender = fake.NewFakeLogSender()
-		logs.Initialize(fakeSender)
+
+		fakeMetronClient = new(mfakes.FakeClient)
 
 		containerConfig := containerstore.ContainerConfig{
 			OwnerName:              ownerName,
@@ -94,11 +125,20 @@ var _ = Describe("Container Store", func() {
 			gardenClient,
 			dependencyManager,
 			volumeManager,
+			credManager,
 			clock,
 			eventEmitter,
 			megatron,
 			"/var/vcap/data/cf-system-trusted-certs",
+			fakeMetronClient,
 		)
+
+		fakeMetronClient.SendDurationStub = func(name string, value time.Duration) error {
+			metricMapLock.Lock()
+			defer metricMapLock.Unlock()
+			metricMap[name] = struct{}{}
+			return nil
+		}
 	})
 
 	Describe("Reserve", func() {
@@ -117,6 +157,7 @@ var _ = Describe("Container Store", func() {
 				DiskMB:     1024,
 				RootFSPath: "/foo/bar",
 			}
+
 			req = &executor.AllocationRequest{
 				Guid:     containerGuid,
 				Tags:     containerTags,
@@ -276,6 +317,7 @@ var _ = Describe("Container Store", func() {
 			resource = executor.Resource{
 				MemoryMB:   1024,
 				DiskMB:     1024,
+				MaxPids:    1024,
 				RootFSPath: "/foo/bar",
 			}
 
@@ -290,12 +332,13 @@ var _ = Describe("Container Store", func() {
 
 		Context("when the container is initializing", func() {
 			var (
-				externalIP string
-				runReq     *executor.RunRequest
+				externalIP, internalIP string
+				runReq                 *executor.RunRequest
 			)
 
 			BeforeEach(func() {
 				externalIP = "6.6.6.6"
+				internalIP = "7.7.7.7"
 				env := []executor.EnvironmentVariable{
 					{Name: "foo", Value: "bar"},
 					{Name: "beep", Value: "booop"},
@@ -326,12 +369,13 @@ var _ = Describe("Container Store", func() {
 						},
 					},
 				}
+
 				runReq = &executor.RunRequest{
 					Guid:    containerGuid,
 					RunInfo: runInfo,
 				}
 
-				gardenContainer.InfoReturns(garden.ContainerInfo{ExternalIP: externalIP}, nil)
+				gardenContainer.InfoReturns(garden.ContainerInfo{ExternalIP: externalIP, ContainerIP: internalIP}, nil)
 				gardenClient.CreateReturns(gardenContainer, nil)
 			})
 
@@ -352,21 +396,48 @@ var _ = Describe("Container Store", func() {
 				Expect(container.State).To(Equal(executor.StateCreated))
 			})
 
-			It("creates the container in garden with the correct limits", func() {
+			It("creates the container in garden with correct image parameters", func() {
 				_, err := containerStore.Create(logger, containerGuid)
 				Expect(err).NotTo(HaveOccurred())
 
 				Expect(gardenClient.CreateCallCount()).To(Equal(1))
 				containerSpec := gardenClient.CreateArgsForCall(0)
 				Expect(containerSpec.Handle).To(Equal(containerGuid))
-				Expect(containerSpec.RootFSPath).To(Equal(resource.RootFSPath))
+				Expect(containerSpec.Image.URI).To(Equal(resource.RootFSPath))
 				Expect(containerSpec.Privileged).To(Equal(true))
+			})
 
+			Context("when setting image credentials", func() {
+				BeforeEach(func() {
+					runReq.RunInfo.ImageUsername = "some-username"
+					runReq.RunInfo.ImagePassword = "some-password"
+				})
+
+				It("creates the container in garden with correct image credentials", func() {
+					_, err := containerStore.Create(logger, containerGuid)
+					Expect(err).NotTo(HaveOccurred())
+
+					Expect(gardenClient.CreateCallCount()).To(Equal(1))
+					containerSpec := gardenClient.CreateArgsForCall(0)
+					Expect(containerSpec.Image.URI).To(Equal(resource.RootFSPath))
+					Expect(containerSpec.Image.Username).To(Equal("some-username"))
+					Expect(containerSpec.Image.Password).To(Equal("some-password"))
+				})
+			})
+
+			It("creates the container in garden with the correct limits", func() {
+				_, err := containerStore.Create(logger, containerGuid)
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(gardenClient.CreateCallCount()).To(Equal(1))
+				containerSpec := gardenClient.CreateArgsForCall(0)
 				Expect(containerSpec.Limits.Memory.LimitInBytes).To(BeEquivalentTo(resource.MemoryMB * 1024 * 1024))
 
 				Expect(containerSpec.Limits.Disk.Scope).To(Equal(garden.DiskLimitScopeExclusive))
 				Expect(containerSpec.Limits.Disk.ByteHard).To(BeEquivalentTo(resource.DiskMB * 1024 * 1024))
 				Expect(containerSpec.Limits.Disk.InodeHard).To(Equal(iNodeLimit))
+
+				Expect(int(containerSpec.Limits.Pid.Max)).To(Equal(resource.MaxPids))
 
 				expectedCPUShares := uint64(float64(maxCPUShares) * float64(runReq.CPUWeight) / 100.0)
 				Expect(containerSpec.Limits.CPU.LimitInShares).To(Equal(expectedCPUShares))
@@ -440,14 +511,85 @@ var _ = Describe("Container Store", func() {
 				Expect(containerSpec.Env).To(Equal(expectedEnv))
 			})
 
-			It("sets the correct external ip", func() {
+			It("sets the correct external and internal ip", func() {
 				container, err := containerStore.Create(logger, containerGuid)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(container.ExternalIP).To(Equal(externalIP))
+				Expect(container.InternalIP).To(Equal(internalIP))
+			})
+
+			It("emits metrics after creating the container", func() {
+				_, err := containerStore.Create(logger, containerGuid)
+				Expect(err).NotTo(HaveOccurred())
+				Eventually(getMetrics).Should(HaveKey(containerstore.GardenContainerCreationDuration))
+				Eventually(getMetrics).Should(HaveKey(containerstore.GardenContainerCreationSucceededDuration))
+			})
+
+			It("sends a log after creating the container", func() {
+				_, err := containerStore.Create(logger, containerGuid)
+				Expect(err).NotTo(HaveOccurred())
+				Eventually(fakeMetronClient.SendAppLogCallCount()).Should(Equal(2))
+				Eventually(func() string {
+					_, msg, _, _ := fakeMetronClient.SendAppLogArgsForCall(1)
+					return msg
+				}).Should(ContainSubstring("Successfully created container"))
+			})
+
+			It("generates container credential directory", func() {
+				_, err := containerStore.Create(logger, containerGuid)
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(credManager.CreateCredDirCallCount()).To(Equal(1))
+				_, container := credManager.CreateCredDirArgsForCall(0)
+				Expect(container.Guid).To(Equal(containerGuid))
+			})
+
+			Context("when credential mounts are configured", func() {
+				var (
+					expectedBindMount garden.BindMount
+				)
+
+				BeforeEach(func() {
+					expectedBindMount = garden.BindMount{SrcPath: "hpath1", DstPath: "cpath1", Mode: garden.BindMountModeRO, Origin: garden.BindMountOriginHost}
+					envVariables := []executor.EnvironmentVariable{
+						{Name: "CF_INSTANCE_CERT", Value: "some-cert"},
+					}
+					credManager.CreateCredDirReturns([]garden.BindMount{expectedBindMount}, envVariables, nil)
+				})
+
+				It("mounts the credential directory into the container", func() {
+					_, err := containerStore.Create(logger, containerGuid)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(gardenClient.CreateCallCount()).To(Equal(1))
+					Expect(gardenClient.CreateArgsForCall(0).BindMounts).To(ContainElement(expectedBindMount))
+				})
+
+				It("add the instance identity environment variables to the container", func() {
+					_, err := containerStore.Create(logger, containerGuid)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(gardenClient.CreateCallCount()).To(Equal(1))
+					Expect(gardenClient.CreateArgsForCall(0).Env).To(ContainElement("CF_INSTANCE_CERT=some-cert"))
+				})
+
+				Context("when failing to create credential directory on host", func() {
+					BeforeEach(func() {
+						credManager.CreateCredDirReturns(nil, nil, errors.New("failed to create dir"))
+					})
+
+					It("fails fast and completes the container", func() {
+						_, err := containerStore.Create(logger, containerGuid)
+						Expect(err).To(HaveOccurred())
+
+						container, err := containerStore.Get(logger, containerGuid)
+						Expect(err).NotTo(HaveOccurred())
+						Expect(container.State).To(Equal(executor.StateCompleted))
+						Expect(container.RunResult.Failed).To(BeTrue())
+						Expect(container.RunResult.FailureReason).To(Equal(containerstore.CredDirFailed))
+					})
+				})
 			})
 
 			Context("when there are volume mounts configured", func() {
-
 				BeforeEach(func() {
 					someConfig := map[string]interface{}{"some-config": "interface"}
 					runReq.RunInfo.VolumeMounts = []executor.VolumeMount{
@@ -580,9 +722,9 @@ var _ = Describe("Container Store", func() {
 						},
 						{
 							Protocol:     "icmp",
-							Destinations: []string{"1.1.1.1"},
+							Destinations: []string{"1.1.1.2"},
 							IcmpInfo: &models.ICMPInfo{
-								Type: 2,
+								Type: 3,
 								Code: 10,
 							},
 						},
@@ -594,40 +736,36 @@ var _ = Describe("Container Store", func() {
 					_, err := containerStore.Create(logger, containerGuid)
 					Expect(err).NotTo(HaveOccurred())
 
-					Expect(gardenContainer.NetOutCallCount()).To(Equal(2))
-				})
-
-				Context("when NetOut fails", func() {
-					BeforeEach(func() {
-						gardenContainer.NetOutStub = func(garden.NetOutRule) error {
-							if gardenContainer.NetOutCallCount() == 1 {
-								return nil
-							} else {
-								return errors.New("failed net out!")
-							}
-						}
-					})
-
-					It("destroys the created container and returns an error", func() {
-						_, err := containerStore.Create(logger, containerGuid)
-						Expect(err).To(Equal(errors.New("failed net out!")))
-
-						Expect(gardenClient.CreateCallCount()).To(Equal(1))
-						Expect(gardenClient.DestroyCallCount()).To(Equal(1))
-
-						Expect(gardenClient.DestroyArgsForCall(0)).To(Equal(containerGuid))
-					})
-
-					It("transitions to a completed state", func() {
-						_, err := containerStore.Create(logger, containerGuid)
-						Expect(err).To(HaveOccurred())
-
-						container, err := containerStore.Get(logger, containerGuid)
-						Expect(err).NotTo(HaveOccurred())
-						Expect(container.State).To(Equal(executor.StateCompleted))
-						Expect(container.RunResult.Failed).To(BeTrue())
-						Expect(container.RunResult.FailureReason).To(Equal(containerstore.ContainerInitializationFailedMessage))
-					})
+					Expect(gardenClient.CreateCallCount()).To(Equal(1))
+					containerSpec := gardenClient.CreateArgsForCall(0)
+					Expect(containerSpec.NetOut).To(HaveLen(2))
+					icmpCode := garden.ICMPCode(10)
+					Expect(containerSpec.NetOut).To(ContainElement(garden.NetOutRule{
+						Protocol: garden.Protocol(3),
+						Networks: []garden.IPRange{
+							{
+								Start: net.ParseIP("1.1.1.1"),
+								End:   net.ParseIP("1.1.1.1"),
+							},
+						},
+						ICMPs: &garden.ICMPControl{
+							Type: 2,
+							Code: &icmpCode,
+						},
+					}))
+					Expect(containerSpec.NetOut).To(ContainElement(garden.NetOutRule{
+						Protocol: garden.Protocol(3),
+						Networks: []garden.IPRange{
+							{
+								Start: net.ParseIP("1.1.1.2"),
+								End:   net.ParseIP("1.1.1.2"),
+							},
+						},
+						ICMPs: &garden.ICMPControl{
+							Type: 3,
+							Code: &icmpCode,
+						},
+					}))
 				})
 
 				Context("when a egress rule is not valid", func() {
@@ -655,15 +793,23 @@ var _ = Describe("Container Store", func() {
 					}
 					runReq.Ports = portMapping
 
-					gardenContainer.NetInStub = func(uint32, containerPort uint32) (uint32, uint32, error) {
-						switch containerPort {
-						case 8080:
-							return 16000, 8080, nil
-						case 9090:
-							return 32000, 9090, nil
-						default:
-							return 0, 0, errors.New("failed-net-in")
+					gardenClient.CreateStub = func(spec garden.ContainerSpec) (garden.Container, error) {
+						gardenContainer.InfoStub = func() (garden.ContainerInfo, error) {
+							info := garden.ContainerInfo{}
+							info.MappedPorts = []garden.PortMapping{}
+							for _, netIn := range spec.NetIn {
+								switch netIn.ContainerPort {
+								case 8080:
+									info.MappedPorts = append(info.MappedPorts, garden.PortMapping{HostPort: 16000, ContainerPort: 8080})
+								case 9090:
+									info.MappedPorts = append(info.MappedPorts, garden.PortMapping{HostPort: 32000, ContainerPort: 9090})
+								default:
+									return info, errors.New("failed-net-in")
+								}
+							}
+							return info, nil
 						}
+						return gardenContainer, nil
 					}
 				})
 
@@ -671,7 +817,14 @@ var _ = Describe("Container Store", func() {
 					_, err := containerStore.Create(logger, containerGuid)
 					Expect(err).NotTo(HaveOccurred())
 
-					Expect(gardenContainer.NetInCallCount()).To(Equal(2))
+					containerSpec := gardenClient.CreateArgsForCall(0)
+					Expect(containerSpec.NetIn).To(HaveLen(2))
+					Expect(containerSpec.NetIn).To(ContainElement(garden.NetIn{
+						HostPort: 0, ContainerPort: 8080,
+					}))
+					Expect(containerSpec.NetIn).To(ContainElement(garden.NetIn{
+						HostPort: 0, ContainerPort: 9090,
+					}))
 				})
 
 				It("saves the actual port mappings on the container", func() {
@@ -686,31 +839,6 @@ var _ = Describe("Container Store", func() {
 					fetchedContainer, err := containerStore.Get(logger, containerGuid)
 					Expect(err).NotTo(HaveOccurred())
 					Expect(fetchedContainer).To(Equal(container))
-				})
-
-				Context("when NetIn fails", func() {
-					BeforeEach(func() {
-						gardenContainer.NetInReturns(0, 0, errors.New("failed generating net in rules"))
-					})
-
-					It("destroys the container and returns an error", func() {
-						_, err := containerStore.Create(logger, containerGuid)
-						Expect(err).To(HaveOccurred())
-
-						Expect(gardenClient.DestroyCallCount()).To(Equal(1))
-						Expect(gardenClient.DestroyArgsForCall(0)).To(Equal(containerGuid))
-					})
-
-					It("transitions to a completed state", func() {
-						_, err := containerStore.Create(logger, containerGuid)
-						Expect(err).To(HaveOccurred())
-
-						container, err := containerStore.Get(logger, containerGuid)
-						Expect(err).NotTo(HaveOccurred())
-						Expect(container.State).To(Equal(executor.StateCompleted))
-						Expect(container.RunResult.Failed).To(BeTrue())
-						Expect(container.RunResult.FailureReason).To(Equal(containerstore.ContainerInitializationFailedMessage))
-					})
 				})
 			})
 
@@ -749,11 +877,22 @@ var _ = Describe("Container Store", func() {
 					Expect(container.RunResult.Failed).To(BeTrue())
 					Expect(container.RunResult.FailureReason).To(Equal(containerstore.ContainerInitializationFailedMessage))
 				})
+
+				It("emits a metric after failing to create the container", func() {
+					_, err := containerStore.Create(logger, containerGuid)
+					Expect(err).To(HaveOccurred())
+					Eventually(getMetrics).Should(HaveKey(containerstore.GardenContainerCreationFailedDuration))
+				})
 			})
 
-			Context("when requesting the external IP for the created fails", func() {
+			Context("when requesting the container info for the created container fails", func() {
 				BeforeEach(func() {
-					gardenContainer.InfoReturns(garden.ContainerInfo{}, errors.New("could not obtain info"))
+					gardenContainer.InfoStub = func() (garden.ContainerInfo, error) {
+						if gardenContainer.InfoCallCount() == 1 {
+							return garden.ContainerInfo{}, nil
+						}
+						return garden.ContainerInfo{}, errors.New("could not obtain info")
+					}
 				})
 
 				It("returns an error", func() {
@@ -800,7 +939,7 @@ var _ = Describe("Container Store", func() {
 	Describe("Run", func() {
 		var (
 			allocationReq *executor.AllocationRequest
-			runProcess    *gfakes.FakeProcess
+			runProcess    *gardenfakes.FakeProcess
 		)
 
 		BeforeEach(func() {
@@ -808,7 +947,7 @@ var _ = Describe("Container Store", func() {
 				Guid: containerGuid,
 			}
 
-			runProcess = &gfakes.FakeProcess{}
+			runProcess = &gardenfakes.FakeProcess{}
 
 			gardenContainer.RunReturns(runProcess, nil)
 			gardenClient.CreateReturns(gardenContainer, nil)
@@ -816,7 +955,9 @@ var _ = Describe("Container Store", func() {
 		})
 
 		Context("when it is in the created state", func() {
-			var runReq *executor.RunRequest
+			var (
+				runReq *executor.RunRequest
+			)
 
 			BeforeEach(func() {
 				runAction := &models.Action{
@@ -844,138 +985,291 @@ var _ = Describe("Container Store", func() {
 				Expect(err).NotTo(HaveOccurred())
 			})
 
-			Context("when the action runs indefinitely", func() {
-				var readyChan chan struct{}
+			Context("while the cred manager is still setting up", func() {
+				var (
+					finishSetup           chan struct{}
+					containerRunnerCalled chan struct{}
+				)
+
 				BeforeEach(func() {
-					readyChan = make(chan struct{})
-					var testRunner ifrit.RunFunc = func(signals <-chan os.Signal, ready chan<- struct{}) error {
-						readyChan <- struct{}{}
+					finishSetup = make(chan struct{})
+					containerRunnerCalled = make(chan struct{})
+					credManager.RunnerReturns(ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
+						<-finishSetup
 						close(ready)
 						<-signals
 						return nil
-					}
-					megatron.StepsRunnerReturns(testRunner, nil)
+					}))
+
+					megatron.StepsRunnerReturns(ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
+						close(containerRunnerCalled)
+						return nil
+					}), nil)
 				})
 
-				It("performs the step", func() {
-					err := containerStore.Run(logger, containerGuid)
-					Expect(err).NotTo(HaveOccurred())
-
-					Expect(megatron.StepsRunnerCallCount()).To(Equal(1))
-					Eventually(readyChan).Should(Receive())
+				AfterEach(func() {
+					close(finishSetup)
+					Expect(containerStore.Destroy(logger, containerGuid)).To(Succeed())
 				})
 
-				It("sets the container state to running once the healthcheck passes, and emits a running event", func() {
+				It("does not start the container while cred manager is setting up", func() {
+					go containerStore.Run(logger, containerGuid)
+					Consistently(containerRunnerCalled).ShouldNot(BeClosed())
+				})
+			})
+
+			Context("when the runner fails the initial credential generation", func() {
+				BeforeEach(func() {
+					credManager.RunnerReturns(ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
+						return errors.New("BOOOM")
+					}))
+				})
+
+				It("destroys the container and returns an error", func() {
 					err := containerStore.Run(logger, containerGuid)
 					Expect(err).NotTo(HaveOccurred())
-
-					container, err := containerStore.Get(logger, containerGuid)
-					Expect(err).NotTo(HaveOccurred())
-					Expect(container.State).To(Equal(executor.StateCreated))
-
-					Eventually(readyChan).Should(Receive())
 
 					Eventually(func() executor.State {
 						container, err := containerStore.Get(logger, containerGuid)
 						Expect(err).NotTo(HaveOccurred())
 						return container.State
-					}).Should(Equal(executor.StateRunning))
+					}).Should(Equal(executor.StateCompleted))
+					container, _ := containerStore.Get(logger, containerGuid)
+					Expect(container.RunResult.Failed).To(BeTrue())
+					// make sure the error message is at the end so that
+					// FailureReasonSanitizer can properly map the error messages
+					Expect(container.RunResult.FailureReason).To(MatchRegexp("BOOOM$"))
+				})
 
-					container, err = containerStore.Get(logger, containerGuid)
+				It("tranistions immediately to Completed state", func() {
+					err := containerStore.Run(logger, containerGuid)
 					Expect(err).NotTo(HaveOccurred())
 
-					Eventually(eventEmitter.EmitCallCount).Should(Equal(2))
-					event := eventEmitter.EmitArgsForCall(1)
-					Expect(event).To(Equal(executor.ContainerRunningEvent{RawContainer: container}))
+					Eventually(func() executor.State {
+						container, err := containerStore.Get(logger, containerGuid)
+						Expect(err).NotTo(HaveOccurred())
+						return container.State
+					}).Should(Equal(executor.StateCompleted))
+
+					Eventually(func() []string {
+						var events []string
+						for i := 0; i < eventEmitter.EmitCallCount(); i++ {
+							event := eventEmitter.EmitArgsForCall(i)
+							events = append(events, string(event.EventType()))
+						}
+						return events
+					}).Should(ConsistOf("container_reserved", "container_complete"))
 				})
 			})
 
-			Context("when the action exits", func() {
-				Context("successfully", func() {
+			Context("when instance credential is ready", func() {
+				var (
+					containerRunnerCalled   chan struct{}
+					credManagerRunnerCalled chan struct{}
+				)
+
+				BeforeEach(func() {
+					credManagerRunnerCalled = make(chan struct{})
+					called := credManagerRunnerCalled
+					credManager.RunnerReturns(ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
+						close(ready)
+						close(called)
+						<-signals
+						return nil
+					}))
+
+					containerRunnerCalled = make(chan struct{})
+
+					megatron.StepsRunnerReturns(ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
+						close(containerRunnerCalled)
+						close(ready)
+						<-signals
+						return nil
+					}), nil)
+				})
+
+				AfterEach(func() {
+					containerStore.Destroy(logger, containerGuid)
+				})
+
+				Context("when the runner fails subsequent credential generation", func() {
 					BeforeEach(func() {
-						var testRunner ifrit.RunFunc = func(signals <-chan os.Signal, ready chan<- struct{}) error {
+						credManager.RunnerReturns(ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
 							close(ready)
+							select {
+							case <-containerRunnerCalled:
+								return errors.New("BOOOM")
+							case <-signals:
+								return nil
+							}
+						}))
+					})
+
+					It("destroys the container and returns an error", func() {
+						err := containerStore.Run(logger, containerGuid)
+						Expect(err).NotTo(HaveOccurred())
+
+						Eventually(func() executor.State {
+							container, err := containerStore.Get(logger, containerGuid)
+							Expect(err).NotTo(HaveOccurred())
+							return container.State
+						}).Should(Equal(executor.StateCompleted))
+						container, _ := containerStore.Get(logger, containerGuid)
+						Expect(container.RunResult.Failed).To(BeTrue())
+						// make sure the error message is at the end so that
+						// FailureReasonSanitizer can properly map the error messages
+						Expect(container.RunResult.FailureReason).To(MatchRegexp("BOOOM$"))
+					})
+				})
+
+				Context("when the action runs indefinitely", func() {
+					var readyChan chan struct{}
+					BeforeEach(func() {
+						readyChan = make(chan struct{})
+						var testRunner ifrit.RunFunc = func(signals <-chan os.Signal, ready chan<- struct{}) error {
+							readyChan <- struct{}{}
+							close(ready)
+							<-signals
 							return nil
 						}
 						megatron.StepsRunnerReturns(testRunner, nil)
 					})
 
-					It("sets its state to completed", func() {
+					It("performs the step", func() {
 						err := containerStore.Run(logger, containerGuid)
 						Expect(err).NotTo(HaveOccurred())
 
-						Eventually(pollForComplete(containerGuid)).Should(BeTrue())
-
-						container, err := containerStore.Get(logger, containerGuid)
-						Expect(err).NotTo(HaveOccurred())
-						Expect(container.State).To(Equal(executor.StateCompleted))
+						Expect(megatron.StepsRunnerCallCount()).To(Equal(1))
+						Eventually(readyChan).Should(Receive())
 					})
 
-					It("emits a container completed event", func() {
+					It("sets the container state to running once the healthcheck passes, and emits a running event", func() {
 						err := containerStore.Run(logger, containerGuid)
 						Expect(err).NotTo(HaveOccurred())
 
-						Eventually(pollForComplete(containerGuid)).Should(BeTrue())
-
-						Eventually(eventEmitter.EmitCallCount).Should(Equal(3))
-
 						container, err := containerStore.Get(logger, containerGuid)
 						Expect(err).NotTo(HaveOccurred())
+						Expect(container.State).To(Equal(executor.StateCreated))
 
-						emittedEvents := []executor.Event{}
-						for i := 0; i < 3; i++ {
-							emittedEvents = append(emittedEvents, eventEmitter.EmitArgsForCall(i))
-						}
-						Expect(emittedEvents).To(ContainElement(executor.ContainerCompleteEvent{
-							RawContainer: container,
-						}))
-					})
+						Eventually(readyChan).Should(Receive())
 
-					It("sets the result on the container", func() {
-						err := containerStore.Run(logger, containerGuid)
+						Eventually(func() executor.State {
+							container, err := containerStore.Get(logger, containerGuid)
+							Expect(err).NotTo(HaveOccurred())
+							return container.State
+						}).Should(Equal(executor.StateRunning))
+
+						container, err = containerStore.Get(logger, containerGuid)
 						Expect(err).NotTo(HaveOccurred())
 
-						Eventually(pollForComplete(containerGuid)).Should(BeTrue())
-
-						container, err := containerStore.Get(logger, containerGuid)
-						Expect(err).NotTo(HaveOccurred())
-						Expect(container.RunResult.Failed).To(Equal(false))
-						Expect(container.RunResult.Stopped).To(Equal(false))
+						Eventually(eventEmitter.EmitCallCount).Should(Equal(2))
+						event := eventEmitter.EmitArgsForCall(1)
+						Expect(event).To(Equal(executor.ContainerRunningEvent{RawContainer: container}))
 					})
 				})
 
-				Context("unsuccessfully", func() {
+				Context("when the action exits", func() {
+					Context("successfully", func() {
+						var (
+							completeChan chan struct{}
+						)
+
+						BeforeEach(func() {
+							completeChan = make(chan struct{})
+
+							var testRunner ifrit.RunFunc = func(signals <-chan os.Signal, ready chan<- struct{}) error {
+								close(ready)
+								<-completeChan
+								return nil
+							}
+							megatron.StepsRunnerReturns(testRunner, nil)
+						})
+
+						It("sets its state to completed", func() {
+							err := containerStore.Run(logger, containerGuid)
+							Expect(err).NotTo(HaveOccurred())
+
+							close(completeChan)
+
+							Eventually(pollForComplete(containerGuid)).Should(BeTrue())
+
+							container, err := containerStore.Get(logger, containerGuid)
+							Expect(err).NotTo(HaveOccurred())
+							Expect(container.State).To(Equal(executor.StateCompleted))
+						})
+
+						It("emits a container completed event", func() {
+							err := containerStore.Run(logger, containerGuid)
+							Expect(err).NotTo(HaveOccurred())
+
+							Eventually(pollForRunning(containerGuid)).Should(BeTrue())
+							close(completeChan)
+							Eventually(pollForComplete(containerGuid)).Should(BeTrue())
+
+							Expect(eventEmitter.EmitCallCount()).To(Equal(3))
+
+							container, err := containerStore.Get(logger, containerGuid)
+							Expect(err).NotTo(HaveOccurred())
+
+							emittedEvents := []executor.Event{}
+							for i := 0; i < eventEmitter.EmitCallCount(); i++ {
+								emittedEvents = append(emittedEvents, eventEmitter.EmitArgsForCall(i))
+							}
+							Expect(emittedEvents).To(ContainElement(executor.ContainerCompleteEvent{
+								RawContainer: container,
+							}))
+						})
+
+						It("sets the result on the container", func() {
+							err := containerStore.Run(logger, containerGuid)
+							Expect(err).NotTo(HaveOccurred())
+
+							close(completeChan)
+
+							Eventually(pollForComplete(containerGuid)).Should(BeTrue())
+
+							container, err := containerStore.Get(logger, containerGuid)
+							Expect(err).NotTo(HaveOccurred())
+							Expect(container.RunResult.Failed).To(Equal(false))
+							Expect(container.RunResult.Stopped).To(Equal(false))
+						})
+					})
+
+					Context("unsuccessfully", func() {
+						BeforeEach(func() {
+							var testRunner ifrit.RunFunc = func(signals <-chan os.Signal, ready chan<- struct{}) error {
+								close(ready)
+								return errors.New("BOOOOM!!!!")
+							}
+							megatron.StepsRunnerReturns(testRunner, nil)
+						})
+
+						It("sets the run result on the container", func() {
+							err := containerStore.Run(logger, containerGuid)
+							Expect(err).NotTo(HaveOccurred())
+
+							Eventually(pollForComplete(containerGuid)).Should(BeTrue())
+
+							container, err := containerStore.Get(logger, containerGuid)
+							Expect(err).NotTo(HaveOccurred())
+							Expect(container.RunResult.Failed).To(Equal(true))
+							// make sure the error message is at the end so that
+							// FailureReasonSanitizer can properly map the error messages
+							Expect(container.RunResult.FailureReason).To(MatchRegexp("BOOOOM!!!!$"))
+							Expect(container.RunResult.Stopped).To(Equal(false))
+						})
+					})
+				})
+
+				Context("when the transformer fails to generate steps", func() {
 					BeforeEach(func() {
-						var testRunner ifrit.RunFunc = func(signals <-chan os.Signal, ready chan<- struct{}) error {
-							close(ready)
-							return errors.New("BOOOOM!!!!")
-						}
-						megatron.StepsRunnerReturns(testRunner, nil)
+						megatron.StepsRunnerReturns(nil, errors.New("defeated by the auto bots"))
 					})
 
-					It("sets the run result on the container", func() {
+					It("returns an error", func() {
 						err := containerStore.Run(logger, containerGuid)
-						Expect(err).NotTo(HaveOccurred())
-
-						Eventually(pollForComplete(containerGuid)).Should(BeTrue())
-
-						container, err := containerStore.Get(logger, containerGuid)
-						Expect(err).NotTo(HaveOccurred())
-						Expect(container.RunResult.Failed).To(Equal(true))
-						Expect(container.RunResult.FailureReason).To(Equal("BOOOOM!!!!"))
-						Expect(container.RunResult.Stopped).To(Equal(false))
+						Expect(err).To(HaveOccurred())
 					})
-				})
-			})
-
-			Context("when the transformer fails to generate steps", func() {
-				BeforeEach(func() {
-					megatron.StepsRunnerReturns(nil, errors.New("defeated by the auto bots"))
-				})
-
-				It("returns an error", func() {
-					err := containerStore.Run(logger, containerGuid)
-					Expect(err).To(HaveOccurred())
 				})
 			})
 		})
@@ -1078,7 +1372,7 @@ var _ = Describe("Container Store", func() {
 			}
 			runReq = &executor.RunRequest{Guid: containerGuid, RunInfo: runInfo}
 			gardenClient.CreateReturns(gardenContainer, nil)
-			resource = executor.NewResource(1024, 2048, "foobar")
+			resource = executor.NewResource(1024, 2048, 1024, "foobar")
 			expectedMounts = containerstore.BindMounts{
 				CacheKeys: []containerstore.BindMountCacheKey{
 					{CacheKey: "cache-key", Dir: "foo"},
@@ -1180,6 +1474,13 @@ var _ = Describe("Container Store", func() {
 			Expect(err).To(Equal(executor.ErrContainerNotFound))
 		})
 
+		It("emits a metric after destroying the container", func() {
+			err := containerStore.Destroy(logger, containerGuid)
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(getMetrics).Should(HaveKey(containerstore.GardenContainerDestructionSucceededDuration))
+		})
+
 		It("frees the containers resources", func() {
 			err := containerStore.Destroy(logger, containerGuid)
 			Expect(err).NotTo(HaveOccurred())
@@ -1222,21 +1523,18 @@ var _ = Describe("Container Store", func() {
 				It("logs the container is detrroyed", func() {
 					err := containerStore.Destroy(logger, containerGuid)
 					Expect(err).NotTo(HaveOccurred())
-					logMessages := fakeSender.GetLogs()
-					Expect(logMessages).To(HaveLen(4))
-					emission := logMessages[2]
-					Expect(emission.AppId).To(Equal(containerGuid))
-					Expect(emission.SourceType).To(Equal("test-source"))
-					Expect(string(emission.Message)).To(Equal("Destroying container"))
-					Expect(emission.MessageType).To(Equal("OUT"))
-					Expect(emission.SourceInstance).To(Equal("1"))
+					Expect(fakeMetronClient.SendAppLogCallCount()).To(Equal(4))
+					appId, msg, sourceType, sourceInstance := fakeMetronClient.SendAppLogArgsForCall(2)
+					Expect(appId).To(Equal(containerGuid))
+					Expect(sourceType).To(Equal("test-source"))
+					Expect(msg).To(Equal("Destroying container"))
+					Expect(sourceInstance).To(Equal("1"))
 
-					emission = logMessages[3]
-					Expect(emission.AppId).To(Equal(containerGuid))
-					Expect(emission.SourceType).To(Equal("test-source"))
-					Expect(string(emission.Message)).To(Equal("Successfully destroyed container"))
-					Expect(emission.MessageType).To(Equal("OUT"))
-					Expect(emission.SourceInstance).To(Equal("1"))
+					appId, msg, sourceType, sourceInstance = fakeMetronClient.SendAppLogArgsForCall(3)
+					Expect(appId).To(Equal(containerGuid))
+					Expect(sourceType).To(Equal("test-source"))
+					Expect(msg).To(Equal("Successfully destroyed container"))
+					Expect(sourceInstance).To(Equal("1"))
 				})
 			})
 
@@ -1244,6 +1542,12 @@ var _ = Describe("Container Store", func() {
 				It("returns an error", func() {
 					err := containerStore.Destroy(logger, containerGuid)
 					Expect(err).To(Equal(destroyErr))
+				})
+
+				It("emits a metric after failing to destroy the container", func() {
+					err := containerStore.Destroy(logger, containerGuid)
+					Expect(err).To(Equal(destroyErr))
+					Eventually(getMetrics).Should(HaveKey(containerstore.GardenContainerDestructionFailedDuration))
 				})
 
 				It("does remove the container from the container store", func() {
@@ -1275,33 +1579,52 @@ var _ = Describe("Container Store", func() {
 		})
 
 		Context("when there is a running process associated with the container", func() {
-			var finishRun chan struct{}
+			var (
+				finishRun                 chan struct{}
+				credManagerRunnerSignaled chan struct{}
+				destroyed                 chan struct{}
+			)
+
 			BeforeEach(func() {
+				credManagerRunnerSignaled = make(chan struct{})
 				finishRun = make(chan struct{})
 				var testRunner ifrit.RunFunc = func(signals <-chan os.Signal, ready chan<- struct{}) error {
 					close(ready)
 					<-signals
-					finishRun <- struct{}{}
+					<-finishRun
 					return nil
 				}
 
+				signaled := credManagerRunnerSignaled
 				megatron.StepsRunnerReturns(testRunner, nil)
+				credManager.RunnerReturns(ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
+					close(ready)
+					<-signals
+					close(signaled)
+					return nil
+				}))
 			})
 
 			JustBeforeEach(func() {
 				err := containerStore.Run(logger, containerGuid)
 				Expect(err).NotTo(HaveOccurred())
+				Eventually(pollForRunning(containerGuid)).Should(BeTrue())
+				destroyed = make(chan struct{})
+				go func(ch chan struct{}) {
+					containerStore.Destroy(logger, containerGuid)
+					close(ch)
+				}(destroyed)
 			})
 
 			It("cancels the process", func() {
-				errCh := make(chan error)
-				go func() {
-					errCh <- containerStore.Destroy(logger, containerGuid)
-				}()
+				Consistently(destroyed).ShouldNot(Receive())
+				close(finishRun)
+				Eventually(destroyed).Should(BeClosed())
+			})
 
-				Consistently(errCh).ShouldNot(Receive())
-				Eventually(finishRun).Should(Receive())
-				Eventually(errCh).Should(Receive())
+			It("signals the cred manager runner", func() {
+				close(finishRun)
+				Eventually(credManagerRunnerSignaled).Should(BeClosed())
 			})
 		})
 	})
@@ -1363,7 +1686,6 @@ var _ = Describe("Container Store", func() {
 
 	Describe("Metrics", func() {
 		var containerGuid1, containerGuid2, containerGuid3, containerGuid4 string
-		var container1, container2 executor.Container
 		var (
 			req1    *executor.RunRequest
 			req2    *executor.RunRequest
@@ -1386,10 +1708,10 @@ var _ = Describe("Container Store", func() {
 
 			tags := executor.Tags{}
 
-			container1, err = containerStore.Reserve(logger, &executor.AllocationRequest{Guid: containerGuid1, Tags: tags, Resource: resource})
+			_, err = containerStore.Reserve(logger, &executor.AllocationRequest{Guid: containerGuid1, Tags: tags, Resource: resource})
 			Expect(err).NotTo(HaveOccurred())
 
-			container2, err = containerStore.Reserve(logger, &executor.AllocationRequest{Guid: containerGuid2, Tags: tags, Resource: resource})
+			_, err = containerStore.Reserve(logger, &executor.AllocationRequest{Guid: containerGuid2, Tags: tags, Resource: resource})
 			Expect(err).NotTo(HaveOccurred())
 
 			_, err = containerStore.Reserve(logger, &executor.AllocationRequest{Guid: containerGuid3, Tags: executor.Tags{}})
@@ -1593,13 +1915,13 @@ var _ = Describe("Container Store", func() {
 		)
 
 		BeforeEach(func() {
-			resource = executor.NewResource(512, 512, "")
+			resource = executor.NewResource(512, 512, 1024, "")
 			req := executor.NewAllocationRequest("forever-reserved", &resource, nil)
 
 			_, err := containerStore.Reserve(logger, &req)
 			Expect(err).NotTo(HaveOccurred())
 
-			resource = executor.NewResource(512, 512, "")
+			resource = executor.NewResource(512, 512, 1024, "")
 			req = executor.NewAllocationRequest("eventually-initialized", &resource, nil)
 
 			_, err = containerStore.Reserve(logger, &req)
@@ -1663,7 +1985,7 @@ var _ = Describe("Container Store", func() {
 			containerGuid1, containerGuid2, containerGuid3 string
 			containerGuid4, containerGuid5, containerGuid6 string
 			process                                        ifrit.Process
-			extraGardenContainer                           *gfakes.FakeContainer
+			extraGardenContainer                           *gardenfakes.FakeContainer
 		)
 
 		BeforeEach(func() {
@@ -1716,7 +2038,7 @@ var _ = Describe("Container Store", func() {
 
 			Eventually(eventEmitter.EmitCallCount).Should(Equal(7))
 
-			extraGardenContainer = &gfakes.FakeContainer{}
+			extraGardenContainer = &gardenfakes.FakeContainer{}
 			extraGardenContainer.HandleReturns("foobar")
 			gardenContainer.HandleReturns(containerGuid3)
 			gardenContainers := []garden.Container{gardenContainer, extraGardenContainer}

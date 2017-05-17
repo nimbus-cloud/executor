@@ -11,8 +11,8 @@ import (
 	"code.cloudfoundry.org/clock"
 	"code.cloudfoundry.org/executor"
 	"code.cloudfoundry.org/executor/depot/log_streamer"
+	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/lager"
-	"github.com/cloudfoundry-incubator/garden"
 )
 
 const TerminateTimeout = 10 * time.Second
@@ -26,6 +26,7 @@ type runStep struct {
 	streamer             log_streamer.LogStreamer
 	logger               lager.Logger
 	externalIP           string
+	internalIP           string
 	portMappings         []executor.PortMapping
 	exportNetworkEnvVars bool
 	clock                clock.Clock
@@ -35,15 +36,14 @@ type runStep struct {
 }
 
 func NewRun(
-container garden.Container,
-model models.RunAction,
-streamer log_streamer.LogStreamer,
-logger lager.Logger,
-externalIP string,
-portMappings []executor.PortMapping,
-exportNetworkEnvVars bool,
-clock clock.Clock,
-zone string,
+	container garden.Container,
+	model models.RunAction,
+	streamer log_streamer.LogStreamer,
+	logger lager.Logger,
+	externalIP string,
+	internalIP string,portMappings []executor.PortMapping,
+	exportNetworkEnvVars bool,
+	clock clock.Clock,zone string,
 ) *runStep {
 	logger = logger.Session("run-step")
 	return &runStep{
@@ -52,6 +52,7 @@ zone string,
 		streamer:             streamer,
 		logger:               logger,
 		externalIP:           externalIP,
+		internalIP:           internalIP,
 		portMappings:         portMappings,
 		exportNetworkEnvVars: exportNetworkEnvVars,
 		clock:                clock,
@@ -104,25 +105,43 @@ func (step *runStep) Perform() error {
 		}
 	}
 
-	process, err := step.container.Run(garden.ProcessSpec{
-		Path: step.model.Path,
-		Args: step.model.Args,
-		Dir:  step.model.Dir,
-		Env:  envVars,
-		User: step.model.User,
+	processChan := make(chan garden.Process, 1)
+	runStartTime := step.clock.Now()
+	go func() {
+		process, err := step.container.Run(garden.ProcessSpec{
+			Path: step.model.Path,
+			Args: step.model.Args,
+			Dir:  step.model.Dir,
+			Env:  envVars,
+			User: step.model.User,
 
-		Limits: garden.ResourceLimits{
-			Nofile: nofile,
-			Nproc:  nproc,
-		},
-	}, processIO)
-	if err != nil {
-		step.logger.Error("failed-creating-process", err)
-		return err
+			Limits: garden.ResourceLimits{
+				Nofile: nofile,
+				Nproc:  nproc,
+			},
+		}, processIO)
+		if err != nil {
+			errChan <- err
+		} else {
+			processChan <- process
+		}
+	}()
+
+	var process garden.Process
+	select {
+	case err := <-errChan:
+		if err != nil {
+			step.logger.Error("failed-creating-process", err, lager.Data{"duration": step.clock.Now().Sub(runStartTime)})
+			return err
+		}
+	case process = <-processChan:
+	case <-cancel:
+		step.logger.Info("cancelled-before-process-creation-completed")
+		return ErrCancelled
 	}
 
 	logger := step.logger.WithData(lager.Data{"process": process.ID()})
-	logger.Debug("successful-process-create")
+	logger.Debug("successful-process-create", lager.Data{"duration": step.clock.Now().Sub(runStartTime)})
 
 	go func() {
 		exitStatus, err := process.Wait()
@@ -167,6 +186,7 @@ func (step *runStep) Perform() error {
 					}
 				}
 
+				logger.Error("run-step-failed-with-nonzero-status-code", err, lager.Data{"status-code": exitStatus})
 				return NewEmittableError(nil, "Exited with status %d", exitStatus)
 			}
 
@@ -310,6 +330,7 @@ func (step *runStep) networkingEnvVars() []string {
 	var envVars []string
 
 	envVars = append(envVars, "CF_INSTANCE_IP="+step.externalIP)
+	envVars = append(envVars, "CF_INSTANCE_INTERNAL_IP="+step.internalIP)
 
 	if len(step.portMappings) > 0 {
 		envVars = append(envVars, fmt.Sprintf("CF_INSTANCE_PORT=%d", step.portMappings[0].HostPort))

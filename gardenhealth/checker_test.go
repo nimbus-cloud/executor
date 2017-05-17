@@ -6,12 +6,13 @@ import (
 	"code.cloudfoundry.org/executor/depot/containerstore"
 	"code.cloudfoundry.org/executor/gardenhealth"
 	"code.cloudfoundry.org/executor/guidgen/fakeguidgen"
+	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/garden/gardenfakes"
 	"code.cloudfoundry.org/lager/lagertest"
-	"github.com/cloudfoundry-incubator/garden"
-	gardenFakes "github.com/cloudfoundry-incubator/garden/fakes"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gbytes"
 )
 
 var _ = Describe("Checker", func() {
@@ -22,7 +23,7 @@ var _ = Describe("Checker", func() {
 	)
 	var (
 		gardenChecker   gardenhealth.Checker
-		gardenClient    *gardenFakes.FakeClient
+		gardenClient    *gardenfakes.FakeClient
 		healthcheckSpec garden.ProcessSpec
 		logger          *lagertest.TestLogger
 	)
@@ -34,22 +35,22 @@ var _ = Describe("Checker", func() {
 			User: "vcap",
 		}
 		logger = lagertest.NewTestLogger("test")
-		gardenClient = &gardenFakes.FakeClient{}
+		gardenClient = &gardenfakes.FakeClient{}
 		guidGenerator := &fakeguidgen.FakeGenerator{}
 		guidGenerator.GuidReturns("abc-123")
 		gardenChecker = gardenhealth.NewChecker(rootfsPath, containerOwnerName, 0, healthcheckSpec, gardenClient, guidGenerator)
 	})
 
 	Describe("Healthcheck", func() {
-		var fakeContainer *gardenFakes.FakeContainer
-		var oldContainer *gardenFakes.FakeContainer
-		var fakeProcess *gardenFakes.FakeProcess
+		var fakeContainer *gardenfakes.FakeContainer
+		var oldContainer *gardenfakes.FakeContainer
+		var fakeProcess *gardenfakes.FakeProcess
 
 		BeforeEach(func() {
-			fakeContainer = &gardenFakes.FakeContainer{}
-			oldContainer = &gardenFakes.FakeContainer{}
+			fakeContainer = &gardenfakes.FakeContainer{}
+			oldContainer = &gardenfakes.FakeContainer{}
 			oldContainer.HandleReturns("old-guid")
-			fakeProcess = &gardenFakes.FakeProcess{}
+			fakeProcess = &gardenfakes.FakeProcess{}
 		})
 
 		Context("When garden is healthy", func() {
@@ -231,6 +232,54 @@ var _ = Describe("Checker", func() {
 				Expect(gardenClient.DestroyCallCount()).To(Equal(retryCount))
 				By("Returns the error")
 				Expect(err).To(Equal(destroyErr))
+			})
+		})
+	})
+
+	Describe("Cancel", func() {
+		var oldContainer *gardenfakes.FakeContainer
+
+		BeforeEach(func() {
+			oldContainer = &gardenfakes.FakeContainer{}
+			oldContainer.HandleReturns("old-guid")
+			gardenClient.ContainersReturns([]garden.Container{oldContainer}, nil)
+		})
+
+		It("destroys any containers with the healthcheck tag", func() {
+			gardenChecker.Cancel(logger)
+
+			By("Fetching any pre-existing healthcheck containers")
+			Expect(gardenClient.ContainersCallCount()).To(Equal(1))
+			properties := gardenClient.ContainersArgsForCall(0)
+			Expect(properties).To(Equal(garden.Properties{
+				gardenhealth.HealthcheckTag: gardenhealth.HealthcheckTagValue,
+			}))
+
+			By("Deleting all pre-existing-containers")
+			Expect(gardenClient.DestroyCallCount()).To(Equal(1))
+			guid := gardenClient.DestroyArgsForCall(0)
+			Expect(guid).To(Equal("old-guid"))
+		})
+
+		Context("when listing the containers fails", func() {
+			BeforeEach(func() {
+				gardenClient.ContainersReturns(nil, errors.New("boom!"))
+			})
+
+			It("logs the error", func() {
+				gardenChecker.Cancel(logger)
+				Expect(logger).To(gbytes.Say("failed-to-list-containers"))
+			})
+		})
+
+		Context("when destroying the container fails", func() {
+			BeforeEach(func() {
+				gardenClient.DestroyReturns(errors.New("boom!"))
+			})
+
+			It("logs the error", func() {
+				gardenChecker.Cancel(logger)
+				Expect(logger).To(gbytes.Say("failed-to-destroy-containers"))
 			})
 		})
 	})
