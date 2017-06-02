@@ -82,7 +82,10 @@ func (step *nimbusFirewallsStep) parseConfig(configFolder, env string) *Backends
 	tarStream := tar.NewReader(outStream)
 	_, err = tarStream.Next()
 	if err != nil {
-		step.logger.Error("failed-to-read-stream", err)
+		// EOF - no backends file inside the app
+		if err.Error() != "EOF" {
+			step.logger.Error("failed-to-read-stream", err)
+		}
 		return nil
 	}
 
