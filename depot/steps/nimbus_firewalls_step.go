@@ -36,7 +36,7 @@ firewallEnv string,
 	}
 }
 
-var configFolders = []string{"/app/nb-config", "/app/tomcat/webapps/ROOT/nb-config"}
+var configFolders = []string{"/app/nb-config", "/app/tomcat/webapps/ROOT/nb-config", "/app/public/nb-config"}
 
 func (step *nimbusFirewallsStep) Perform() error {
 	step.logger.Info("nimbus firewalls")
