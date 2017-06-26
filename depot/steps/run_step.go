@@ -13,6 +13,7 @@ import (
 	"code.cloudfoundry.org/executor/depot/log_streamer"
 	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/lager"
+	"strings"
 )
 
 const TerminateTimeout = 10 * time.Second
@@ -314,7 +315,7 @@ func (step *runStep) webProxyFromVcapServices(vcapServicesJson string) (map[stri
 	for _, v := range parsed {
 		vv := v.([]interface{})
 		vvv := vv[0].(map[string]interface{})
-		if vvv["label"] != nil && vvv["label"].(string) == "proxy" {
+		if vvv["label"] != nil && strings.Contains(vvv["label"].(string), "proxy") {
 			creds := vvv["credentials"].(map[string]interface{})
 			proxy["host"] = creds["host"].(string)
 			proxy["port"] = fmt.Sprintf("%.0f", creds["port"].(float64))
